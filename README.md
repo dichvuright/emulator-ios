@@ -1,205 +1,119 @@
-# ios-sweet
-
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
-
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
-
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
-
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
-
-## What works
-
-| Area | State |
-| --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
-
-## What does not work (yet)
-
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
-
-## How it boots
-
-```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
-```
-
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
-
-## How to do it yourself
-
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
-
-### 0. Back up the phone
-
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
-
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
-
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
-```
-
-### 1. Build the kernel
-
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
-
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
-```
-
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
-
-### 2. Build the iOS root image
-
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
-
-```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
-```
-
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
-
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
-```
-
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-What the less obvious boot-args do:
-
-| Boot-arg | Effect |
-| --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
-
-### 4. Flash the root and boot
-
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
-
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
-
-### 5. Read the kernel log
-
-```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
-```
-
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
-
-### QEMU
-
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
-
-## Repository layout
-
-| Path | What |
-| --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
-
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
-
-## Kernel patches
-
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
-
-## Key hardware facts
-
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
-
-## Credits
-
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
-
 # emulator-ios
+
+**Trình giả lập Apple iOS 16.7.16 (`20H392` — iPhone X `iPhone10,3` / `D22AP`) chạy trực tiếp trên Windows PC (QEMU ARM64 + Rust Device Hub GUI + NVIDIA CUDA + Direct-RAM Zero-Copy Bridge).**
+
+Dự án này được phát triển dựa trên nền tảng nghiên cứu port nhân XNU (`xnu-8796`) từ dự án `ios-sweet` (vốn ban đầu chạy trên phần cứng Xiaomi Redmi Note 10 Pro), sau đó được **viết lại, mở rộng và tối ưu hóa toàn diện để khởi động và vận hành trực tiếp hệ điều hành iOS 16.7.16 nguyên bản trên máy tính Windows**.
+
+Toàn bộ không gian người dùng (userland) của **iPhone X iOS 16.7.16 (`20H392`)** — bao gồm `launchd`, hệ thống XPC daemons, `backboardd`, `SpringBoard`, Lock Screen, Home Screen, Today View, Control Center và các ứng dụng gốc (`Settings / Preferences.app`, `App Store`, `Safari`, `Messages`, `Photos`) — khởi động trực tiếp vào giao diện **Device Hub Studio (`sweet-emu.exe`)** trên Windows với tăng tốc phần cứng **NVIDIA CUDA (`nvcuda.dll`)** và cơ chế đọc/ghi bộ nhớ RAM trực tiếp không qua QMP (`sweet-bridge`).
+
+---
+
+## Tính năng hoạt động trên Windows
+
+| Thành phần | Trạng thái hoạt động |
+| --- | --- |
+| **Giao diện Studio (`sweet-emu.exe`)** | Giao diện `Device Hub` 3 cột (`1240×900`, backbuffer 2x Retina `2480×1800`, khung hiển thị iPhone X `720×1600`) viết bằng Rust (`Win32`), tự động khởi chạy máy ảo QEMU khi mở `.exe` |
+| **Tăng tốc GPU (`sweet-gpu`)** | Kernel PTX 6.0 (`sm_50`) nạp trực tiếp qua NVIDIA Driver API (`nvcuda.dll`), xử lý nội suy 9-tap tent filter `1080×2400 -> 720×1600`, unsharp contrast, chế độ Sáng/Tối, Liquid Glass, Color Filters trực tiếp trên GPU NVIDIA (đạt `~1.5 ms`/khung hình trên RTX 5050) |
+| **Zero-Copy Direct-RAM Bridge (`sweet-bridge`)** | Đọc biến đếm `swap_count` (`0.46 µs`), đọc trực tiếp `10.36 MB` framebuffer (`0x9c000000`) từ tiến trình `qemu-system-aarch64.exe` (`~1.9 ms`) bằng `ReadProcessMemory` và bơm sự kiện cảm ứng trực tiếp vào ring buffer `'SWIN'` (`0x9d600000`) bằng `ntdll!NtWriteVirtualMemory` (`~3 µs`) — không tốn bất kỳ lệnh QMP hay khóa Big QEMU Lock (BQL) nào |
+| **CPU & Đa nhân SMP** | Khởi chạy đủ **8/8 nhân ARM64** (`cpu0..cpu7`, `SWEET CPU: 8/8 CPUs initialized, SGI1 verified`) trên QEMU 11.1.0 `virt` (`-accel tcg,thread=multi,tb-size=1024`) |
+| **Bộ nhớ RAM (`phys_base = 0xa0000000`)** | Tối ưu ánh xạ địa chỉ vật lý từ `0xa0000000`, cung cấp **5.17+ GB RAM thực tế** cho XNU (`mem_size = 0x134000000`) cùng giới hạn bộ nhớ `SweetSurface` lên tới **4.0 GB** |
+| **Lưu trữ (`VirtIO-blk` + HFS+)** | Driver `SweetVirtIOBlk` trong XNU đọc/ghi trực tiếp phân vùng gốc `ios16-root-20H392.img` (HFS+ case-sensitive), kèm bộ đồng bộ B-Tree & Allocation Bitmap tự động trong `tools/qemu-sweet.py` |
+| **Đồ họa (`IOSurface` + `IOMobileFramebuffer`)** | Toàn bộ `SpringBoard`, `backboardd`, `CABackdropLayer`, `CAMetalLayer` được patch trong `QuartzCore` (`dyld_shared_cache_arm64.03`) để xuất trực tiếp định dạng **1-plane 8-bit `'BGRA'` (`0x42475241`, stride căn lề 256-byte)**, loại bỏ hoàn toàn bước chuyển đổi phần mềm 2-plane `'b3a8'` và 10-bit `'w30r'` trên CPU |
+| **Cảm ứng, Bàn phím PC & Cử chỉ** | Hỗ trợ chạm, cuộn 120Hz real-time preview, vuốt cạnh dưới về Home / App Switcher (`kIOHIDDigitizerEventFromEdgeTip`), nút Back điều hướng `<`, cuộn con lăn chuột và gõ phím trực tiếp từ bàn phím PC sang bàn phím ảo iOS 16 |
+| **Cài đặt `.IPA` & TrustCache (`sweet-core`)** | Giải nén `.ipa`, tự động băm CDHash vào `sweet_trustcache.bin` và đồng bộ thẳng vào image HFS+ trên Windows |
+
+---
+
+## Kiến trúc khởi động & truyền tải khung hình trên Windows
+
+```text
+sweet-emu.exe (Rust Win32 Device Hub Studio GUI + NVIDIA CUDA PTX Renderer)
+  │
+  ├── Khởi chạy tự động tools/qemu-sweet.py -> qemu-system-aarch64.exe (-M virt, 8 vCPUs, 5.17+ GB Usable RAM)
+  │     └── Boot stub tại 0x40200000 -> payload_virtio.bin (XNU 8796 + qemu.adt D22AP + boot-args)
+  │           └── XNU Kernel -> SweetVirtIOBlk -> ios16-root-20H392.img (HFS+ R/W)
+  │                 └── launchd -> backboardd + SpringBoard + Preferences / Safari / AppStore
+  │
+  └── sweet-bridge (Direct-RAM Zero-BQL I/O):
+        ├── Frame Poller (250 Hz): ReadProcessMemory(SWAP_COUNT_PA @ 0xa2072020)
+        │     └── Khi có frame mới -> ReadProcessMemory(FB_BASE @ 0x9c000000, 10.36 MB) -> CUDA PTX Blit
+        ├── Log Reader: ReadProcessMemory(LOG_RING_PA @ 0xa1c52718) -> Live XNU Console
+        └── Input Writer: NtWriteVirtualMemory('SWIN' Ring @ 0x9d600000) -> _touch_thread (6ms / 16 events) -> SweetHIDTouch
+```
+
+---
+
+## Hướng dẫn chạy trên Windows
+
+### 1. Yêu cầu môi trường
+* **Hệ điều hành**: Windows 10 / Windows 11 (64-bit).
+* **QEMU**: `qemu-system-aarch64.exe` (khuyến nghị QEMU 11.x trở lên tại `C:\Program Files\qemu\`).
+* **Rust Toolchain**: `cargo` / `rustc` (`x86_64-pc-windows-msvc`) để biên dịch workspace `sweet-rs`.
+* **Python 3.10+**: Dùng cho script khởi tạo payload/ADT và đồng bộ HFS+ (`tools/qemu-sweet.py`).
+* **GPU (Tùy chọn nhưng khuyến nghị)**: Card đồ họa NVIDIA hỗ trợ CUDA (`nvcuda.dll`) để kích hoạt bộ dựng hình PTX phần cứng (tự động fallback sang bộ dựng đa luồng SIMD/CPU nếu không có GPU NVIDIA).
+
+### 2. Chuẩn bị `emu_workspace/`
+Đặt các thành phần runtime vào thư mục `emu_workspace/` (thư mục này được loại trừ khỏi Git theo `.gitignore` vì chứa dữ liệu hệ điều hành của Apple):
+* `emu_workspace/kernel.qemu.sweet`: Nhân XNU đã áp dụng chuỗi patch `0001..0082` và các bản vá tối ưu QEMU `virt` / Direct-RAM.
+* `emu_workspace/ios16-root-20H392.img`: Phân vùng gốc HFS+ được tạo từ IPSW iPhone X (`iPhone10,3`, iOS `16.7.16` build `20H392`).
+
+Tạo lại Apple Device Tree (`qemu.adt`) và `payload_virtio.bin` (8 nhân, `phys_base = 0xa0000000`):
+```powershell
+python tools/mkadt.py emu_workspace/qemu.adt --qemu --cpus 8 --highmem
+python tools/mkpayload.py emu_workspace/kernel.qemu.sweet emu_workspace/qemu.adt emu_workspace/payload_virtio.bin --phys-base 0xa0000000 --cmdline "debug=0xc serial=3 cpus=8 tlto=0 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetlog=0 sweetfb_noconsole=1 sweetfb_hz=60 sweetiolog=- sweetsample=- sweetnull=backboardd,SpringBoard"
+```
+
+### 3. Biên dịch và khởi chạy `sweet-emu.exe`
+Chạy trực tiếp bằng file `.bat` ở thư mục gốc:
+```powershell
+.\run-emulator.bat
+```
+Hoặc biên dịch bản `release` tối ưu hóa từ `sweet-rs`:
+```powershell
+cargo build --manifest-path sweet-rs/Cargo.toml --release --bins
+.\sweet-rs\target\release\sweet-emu.exe
+```
+
+### 4. Công cụ CLI điều khiển & benchmark (`sweet-bridge.exe`)
+Ngoài giao diện đồ họa `sweet-emu.exe`, có thể kiểm tra tốc độ đọc RAM trực tiếp hoặc gửi thao tác chạm/vuốt qua CLI:
+```powershell
+.\sweet-rs\target\release\sweet-bridge.exe status
+.\sweet-rs\target\release\sweet-bridge.exe bench
+.\sweet-rs\target\release\sweet-bridge.exe tap 655 290
+.\sweet-rs\target\release\sweet-bridge.exe swipe 540 2385 540 180 280
+.\sweet-rs\target\release\sweet-bridge.exe home
+```
+
+---
+
+## Cấu trúc thư mục dự án
+
+| Đường dẫn | Mô tả |
+| --- | --- |
+| `sweet-rs/crates/sweet-emu/` | Ứng dụng GUI chính `sweet-emu.exe` trên Windows (giao diện `Device Hub` 3 cột, quản lý vòng đời máy ảo, xử lý sự kiện chuột/bàn phím và hiển thị màn hình iPhone X 120Hz) |
+| `sweet-rs/crates/sweet-gpu/` | Engine dựng hình tăng tốc phần cứng **NVIDIA CUDA (`nvcuda.dll` + PTX 6.0 kernel)**, bộ lọc màu, Liquid Glass và kết xuất font TrueType |
+| `sweet-rs/crates/sweet-bridge/` | Dịch vụ cầu nối tốc độ cao Host <-> Guest (`ReadProcessMemory` / `NtWriteVirtualMemory`) giao tiếp trực tiếp với RAM của QEMU không qua QMP |
+| `sweet-rs/crates/sweet-core/` | Quản lý tiến trình QEMU trên Windows (`QemuRunner`), trình tạo Apple Device Tree (`adt.rs`), bộ cài đặt `.ipa` & TrustCache (`ipa.rs`) |
+| `tools/qemu-sweet.py` | Trình khởi chạy QEMU `virt` trên Windows, đồng bộ hóa B-Tree/Bitmap phân vùng HFS+, tinh chỉnh `launchd.plist` và quản lý cấu hình máy ảo |
+| `tools/mkadt.py`, `tools/mkpayload.py` | Công cụ đóng gói Apple Device Tree (`D22AP`) và tạo payload khởi động cho QEMU `virt` |
+| `xnu/patches/` | Chuỗi **82 bản vá nhân XNU (`0001..0082`)**, bao gồm `0046-sweet-iosurface-iomfb.patch` (`SweetSurface` + `AppleCLCD`), `0058-sweet-hid-event-services.patch` (`IOHIDFamily`) và `0082-sweet-qemu-virt-emulator.patch` (hỗ trợ máy ảo QEMU `virt`, `SweetVirtIOBlk`, shared-memory `'SWIN'` touch ring) |
+| `shim/` | Bootloader shim nguyên bản từ nhánh phần cứng `sweet` (lưu giữ để tham khảo và tương thích ngược) |
+| `NOTES.md` | Nhật ký kỹ thuật chi tiết từng giai đoạn phát triển, địa chỉ bản vá nhị phân (`kernel.qemu.sweet`, `dyld_shared_cache`) và kết quả đo kiểm |
+
+---
+
+## Các tối ưu hóa kỹ thuật trọng tâm trên bản Windows
+
+1. **Loại bỏ nghẽn QMP & Big QEMU Lock (BQL)**: Thay thế hoàn toàn cơ chế chụp màn hình qua QMP `pmemsave` và gửi cảm ứng qua UART bằng kỹ thuật ánh xạ trực tiếp vùng nhớ ảo của tiến trình `qemu-system-aarch64.exe` trên Windows (`VirtualQueryEx` + `ReadProcessMemory` + `NtWriteVirtualMemory`).
+2. **Ép định dạng `'BGRA'` (`0x42475241`) toàn cục trong `QuartzCore`**: Vá 29 điểm trong `dyld_shared_cache_arm64.03` (kèm cập nhật mã băm SHA-256 `CS_CodeDirectory` cho từng trang 16 KiB) để vô hiệu hóa `HasExtendedColorDisplay` và nén AGX, giúp `CARenderServer` xuất thẳng bộ đệm 1-plane 8-bit `'BGRA'` thay vì tốn CPU giải nén 2-plane `'b3a8'` / 10-bit `'w30r'`.
+3. **Căn lề dòng 256-byte (`SWEET_SURFACE_ROW_ALIGN = 256`) & vá `CoreMaterial`**: Khắc phục triệt để lỗi sọc chéo 5 dải trên Today View và khối xám `CABackdropLayer` khi không có shader GPU Metal.
+4. **Sửa lỗi `Ticket spinlock timeout` dưới môi trường giả lập TCG**: Vô hiệu hóa bộ đếm timeout `48 ms` (`3,000,000` ticks @ `62.5 MHz`) trong XNU để nhân không bị panic khi luồng vCPU trên Windows bị lập lịch trễ.
+5. **Tối ưu hóa hàng đợi sự kiện cảm ứng `'SWIN'`**: Gộp (`coalesce`) các sự kiện `TouchMove` ngay trong ring buffer `0x9d600000` và nâng deadzone nhận diện chạm icon (`TAP_DEADZONE_IOS_PX = 54`), kết hợp bộ xem trước cuộn 120Hz (`apply_live_scroll_preview`) ngay trên cửa sổ Windows.
+
+---
+
+## Ghi nhận (Credits)
+
+* Nền tảng nghiên cứu port nhân XNU ban đầu được học hỏi từ dự án **`ios-sweet`** (port XNU 8796 lên Xiaomi Redmi Note 10 Pro).
+* Phát triển dựa trên mã nguồn mở của Apple (`xnu`, `IOHIDFamily`, `libpthread`, `hfs`), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw) và [QEMU](https://www.qemu.org).
+* Hệ điều hành iOS và các tệp韌體 (IPSW / `dyld_shared_cache`) thuộc bản quyền của Apple Inc. và không được phân phối kèm trong kho mã nguồn này.
