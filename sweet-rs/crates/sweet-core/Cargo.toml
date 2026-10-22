@@ -1,0 +1,7 @@
+[package]
+name = "sweet-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core Rust engine for ios-sweet: ADT, SWEETXNU payload, Mach-O, TrustCache, IPA installer, and QEMU/QMP controller"
+
+[dependencies]

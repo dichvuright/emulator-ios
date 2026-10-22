@@ -1,0 +1,8 @@
+[package]
+name = "sweet-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Rust framebuffer compositor and OpenGL ES / Metal API forwarding ring for ios-sweet"
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }

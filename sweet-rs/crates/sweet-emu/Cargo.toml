@@ -1,0 +1,14 @@
+[package]
+name = "sweet-emu"
+version = "0.1.0"
+edition = "2021"
+description = "Native BlueStacks-style iOS 16 Desktop Emulator and CLI in Rust"
+
+[[bin]]
+name = "sweet-emu"
+path = "src/main.rs"
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
+sweet-bridge = { path = "../sweet-bridge" }
+sweet-gpu = { path = "../sweet-gpu" }

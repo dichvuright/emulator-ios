@@ -1,0 +1,16 @@
+[package]
+name = "sweet-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Dedicated Zero-BQL Direct-RAM Host-to-Guest Input & Framebuffer Bridge Service for iOS 16 QEMU"
+
+[lib]
+name = "sweet_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sweet-bridge"
+path = "src/main.rs"
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
