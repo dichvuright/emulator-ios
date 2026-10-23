@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -68,6 +68,14 @@ mod win32_ram {
         buffer: *const c_void,
         number_of_bytes_to_write: usize,
         number_of_bytes_written: *mut usize,
+    ) -> i32;
+
+    type NtReadVirtualMemoryFn = unsafe extern "system" fn(
+        process_handle: *mut c_void,
+        base_address: *const c_void,
+        buffer: *mut c_void,
+        number_of_bytes_to_read: usize,
+        number_of_bytes_read: *mut usize,
     ) -> i32;
 
     #[link(name = "kernel32")]
@@ -142,6 +150,124 @@ mod win32_ram {
             ) != 0
                 && n_written == buf.len()
         }
+    }
+
+    fn nt_read_fn() -> Option<NtReadVirtualMemoryFn> {
+        static NT_READ: OnceLock<Option<NtReadVirtualMemoryFn>> = OnceLock::new();
+        *NT_READ.get_or_init(|| unsafe {
+            let h_ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+            if h_ntdll.is_null() {
+                return None;
+            }
+            let p = GetProcAddress(h_ntdll, b"NtReadVirtualMemory\0".as_ptr());
+            if p.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, NtReadVirtualMemoryFn>(p))
+            }
+        })
+    }
+
+    unsafe fn read_proc_mem(handle: *mut c_void, addr: usize, dst_ptr: *mut u8, len: usize) -> bool {
+        let mut n_read: usize = 0;
+        if let Some(nt_read) = nt_read_fn() {
+            let st = nt_read(
+                handle,
+                addr as *const c_void,
+                dst_ptr as *mut c_void,
+                len,
+                &mut n_read,
+            );
+            st == 0 && n_read == len
+        } else {
+            ReadProcessMemory(
+                handle,
+                addr as *const c_void,
+                dst_ptr as *mut c_void,
+                len,
+                &mut n_read,
+            ) != 0
+                && n_read == len
+        }
+    }
+
+    struct ParallelFbPool {
+        job: Mutex<FbStripeJob>,
+        start_cv: std::sync::Condvar,
+        done_cv: std::sync::Condvar,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FbStripeJob {
+        gen: u64,
+        handle: usize,
+        src_base: usize,
+        dst_base: usize,
+        stripe_len: usize,
+        completed: u32,
+        all_ok: bool,
+    }
+
+    fn fb_pool() -> &'static Arc<ParallelFbPool> {
+        static POOL: OnceLock<Arc<ParallelFbPool>> = OnceLock::new();
+        POOL.get_or_init(|| {
+            let pool = Arc::new(ParallelFbPool {
+                job: Mutex::new(FbStripeJob {
+                    gen: 0,
+                    handle: 0,
+                    src_base: 0,
+                    dst_base: 0,
+                    stripe_len: 0,
+                    completed: 0,
+                    all_ok: true,
+                }),
+                start_cv: std::sync::Condvar::new(),
+                done_cv: std::sync::Condvar::new(),
+            });
+            for stripe_idx in 1..4usize {
+                let p = Arc::clone(&pool);
+                let _ = std::thread::Builder::new()
+                    .name(format!("sweet-fb-dma-{}", stripe_idx))
+                    .spawn(move || {
+                        let mut seen_gen = 0u64;
+                        loop {
+                            let cur = {
+                                let mut g = match p.job.lock() {
+                                    Ok(g) => g,
+                                    Err(_) => return,
+                                };
+                                while g.gen == seen_gen {
+                                    g = match p.start_cv.wait(g) {
+                                        Ok(g) => g,
+                                        Err(_) => return,
+                                    };
+                                }
+                                seen_gen = g.gen;
+                                *g
+                            };
+                            let off = stripe_idx * cur.stripe_len;
+                            let ok = unsafe {
+                                read_proc_mem(
+                                    cur.handle as *mut c_void,
+                                    cur.src_base.wrapping_add(off),
+                                    (cur.dst_base as *mut u8).add(off),
+                                    cur.stripe_len,
+                                )
+                            };
+                            if let Ok(mut g) = p.job.lock() {
+                                if !ok {
+                                    g.all_ok = false;
+                                }
+                                g.completed += 1;
+                                if g.completed >= 3 {
+                                    p.done_cv.notify_one();
+                                }
+                            }
+                        }
+                    });
+            }
+            pool
+        })
     }
 
     unsafe fn verify_stub(handle: *mut c_void, base: usize) -> bool {
@@ -355,17 +481,44 @@ mod win32_ram {
             return false;
         };
         let host_va = base.wrapping_add((FB_BASE - 0x4000_0000) as usize);
-        let mut n_read: usize = 0;
-        let ok = unsafe {
-            ReadProcessMemory(
-                handle,
-                host_va as *const c_void,
-                dst.as_mut_ptr() as *mut c_void,
-                want,
-                &mut n_read,
-            )
-        };
-        if ok != 0 && n_read == want {
+
+        if want == FB_SIZE_BYTES {
+            static DISPATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            if let Ok(_serial) = DISPATCH_LOCK.get_or_init(|| Mutex::new(())).lock() {
+                let pool = fb_pool();
+                let stripe_len = want / 4;
+                if let Ok(mut g) = pool.job.lock() {
+                    g.handle = handle as usize;
+                    g.src_base = host_va;
+                    g.dst_base = dst.as_mut_ptr() as usize;
+                    g.stripe_len = stripe_len;
+                    g.completed = 0;
+                    g.all_ok = true;
+                    g.gen = g.gen.wrapping_add(1);
+                    pool.start_cv.notify_all();
+                }
+                let ok0 = unsafe { read_proc_mem(handle, host_va, dst.as_mut_ptr(), stripe_len) };
+                let workers_ok = if let Ok(mut g) = pool.job.lock() {
+                    while g.completed < 3 {
+                        g = match pool.done_cv.wait(g) {
+                            Ok(g) => g,
+                            Err(_) => return false,
+                        };
+                    }
+                    g.all_ok
+                } else {
+                    false
+                };
+                if ok0 && workers_ok {
+                    return true;
+                }
+                invalidate_attachment();
+                return false;
+            }
+        }
+
+        let ok = unsafe { read_proc_mem(handle, host_va, dst.as_mut_ptr(), want) };
+        if ok {
             true
         } else {
             invalidate_attachment();

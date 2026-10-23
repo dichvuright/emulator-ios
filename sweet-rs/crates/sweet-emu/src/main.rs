@@ -339,6 +339,13 @@ pub struct SweetEmuApp {
     pub qemu_active: bool,
     pub has_live_vm_frame: bool,
     pub hle_turbo_mode: bool,
+    pub hybrid_gpu_120hz: bool,
+    pub interp_start_instant: Instant,
+    pub interp_span_us: u64,
+    pub interp_active: bool,
+    pub gpu_out_fps: f64,
+    pub gpu_out_accum: u32,
+    pub gpu_out_last_instant: Instant,
     pub vm_boot_start: Instant,
     pub viewport_buf: Vec<u32>,
     pub qemu_fb_raw: Vec<u8>,
@@ -535,21 +542,30 @@ fn build_device_hub_buttons() -> Vec<SidebarButton> {
         },
         // --- Center Viewport: Top & Bottom Floating Toolbars ---
         SidebarButton {
-            id: 35,
-            x: 566,
+            id: 36,
+            x: 512,
             y: 10,
-            w: 88,
+            w: 80,
+            h: 26,
+            label: "GPU 120Hz",
+            accent: 0x0025_63EB,
+        },
+        SidebarButton {
+            id: 35,
+            x: 596,
+            y: 10,
+            w: 80,
             h: 26,
             label: "HLE 120Hz",
             accent: 0x0010_B981,
         },
         SidebarButton {
             id: 4,
-            x: 660,
+            x: 680,
             y: 10,
-            w: 98,
+            w: 80,
             h: 26,
-            label: "Power / Lock",
+            label: "Power",
             accent: 0x00F5_9E0B,
         },
         SidebarButton {
@@ -806,8 +822,12 @@ impl SweetEmuApp {
         let bridge = SweetBridgeService::new(workspace_dir.clone());
 
         let cuda = CudaAccelerator::new();
+        let has_cuda = cuda.available;
         let cuda_summary = if cuda.available {
-            format!("CUDA Active: {} ({} MB VRAM)", cuda.device_name, cuda.vram_mb)
+            format!(
+                "CUDA Hybrid 120Hz: {} ({} MB VRAM, PinnedDMA={})",
+                cuda.device_name, cuda.vram_mb, cuda.pinned_dma
+            )
         } else {
             "CUDA Fallback: CPU SIMD Rasterizer".to_string()
         };
@@ -823,6 +843,13 @@ impl SweetEmuApp {
             qemu_active: true,
             has_live_vm_frame: false,
             hle_turbo_mode: false,
+            hybrid_gpu_120hz: has_cuda,
+            interp_start_instant: Instant::now(),
+            interp_span_us: 72_000,
+            interp_active: false,
+            gpu_out_fps: 0.0,
+            gpu_out_accum: 0,
+            gpu_out_last_instant: Instant::now(),
             vm_boot_start: Instant::now(),
             viewport_buf,
             qemu_fb_raw: initial_fb,
@@ -864,7 +891,7 @@ impl SweetEmuApp {
 
         app.log("Device Hub: iPhone X (iPhone10,3 / D22AP) - Apple iOS 16.7.16 (20H392)");
         app.log(cuda_summary);
-        app.log("SweetBridge: Direct-RAM Zero-BQL FIFO Input & 500Hz/120FPS ProMotion Active");
+        app.log("Pipeline: 4xCPU Direct-RAM + Pinned PCIe DMA + RTX CUDA 120Hz Optical-Flow Active");
         app
     }
 
@@ -879,6 +906,8 @@ impl SweetEmuApp {
             self.qemu_runner.cfg.qemu_bin = bin;
         }
         self.has_live_vm_frame = false;
+        self.interp_active = false;
+        self.cuda.reset_motion_history();
         self.qemu_fb_raw.fill(0);
         self.vm_boot_start = Instant::now();
         self.boot_seq_tick = 0;
@@ -1109,13 +1138,13 @@ impl SweetEmuApp {
                     return;
                 }
                 let (tx, ty) = match app_name.as_str() {
-                    "Photos" => (195, 290),
-                    "App Store" => (425, 290),
-                    "Settings" => (655, 290),
+                    "Photos" => (190, 345),
+                    "App Store" => (380, 345),
+                    "Settings" => (565, 345),
                     "Phone" => (255, 2240),
                     "Safari" => (540, 2240),
                     "Messages" => (825, 2240),
-                    _ => (655, 290),
+                    _ => (565, 345),
                 };
                 self.bridge.tap(tx, ty);
                 self.log(format!(
@@ -1375,6 +1404,8 @@ impl SweetEmuApp {
             35 => {
                 // Toggle ipasim-style Host-Native 120Hz HLE Turbo Mode vs Live QEMU XNU VM
                 self.hle_turbo_mode = !self.hle_turbo_mode;
+                self.interp_active = false;
+                self.cuda.set_temporal_alpha(256);
                 self.ui_dirty = true;
                 self.chrome_dirty = true;
                 if self.hle_turbo_mode {
@@ -1383,6 +1414,18 @@ impl SweetEmuApp {
                     self.cuda.mark_frame_dirty();
                     self.log("[VM] Switched viewport back to Live QEMU XNU 16.7.16 Framebuffer");
                 }
+            }
+            36 => {
+                // Toggle Hybrid CPU+GPU 120Hz Pinned-DMA + Optical-Flow Motion Synthesizer
+                self.hybrid_gpu_120hz = !self.hybrid_gpu_120hz;
+                self.interp_active = false;
+                self.cuda.set_temporal_alpha(256);
+                self.ui_dirty = true;
+                self.chrome_dirty = true;
+                self.log(format!(
+                    "[GPU 120Hz] Hybrid 4xCPU + RTX CUDA Pinned-DMA Optical-Flow Synthesis: {} (F4 to toggle)",
+                    if self.hybrid_gpu_120hz { "ON" } else { "OFF (Raw 1:1 Swap)" }
+                ));
             }
             4 => {
                 // Power (Lock/Wake)
@@ -1641,7 +1684,9 @@ impl SweetEmuApp {
         self.sim_state.tick();
 
         let mut got_new_frame = false;
+        let mut got_interp_step = false;
         let mut got_new_logs = false;
+        let mut new_frame_swap_dt = 0.0f64;
 
         // 1. Pull latest 1080x2400 raw guest frame & kernel logs from SweetBridgeService
         if let Ok(mut st) = self.bridge.state.try_lock() {
@@ -1654,6 +1699,7 @@ impl SweetEmuApp {
                 let next_swap = st.swap_count.max(prev_swap.wrapping_add(1));
                 let swap_delta = next_swap.saturating_sub(prev_swap).max(1) as f64;
                 let swap_dt = self.last_guest_swap_instant.elapsed().as_secs_f64();
+                new_frame_swap_dt = swap_dt;
                 self.last_guest_swap_instant = Instant::now();
                 if swap_dt > 0.002 && swap_dt < 1.5 {
                     let inst_gfps = (swap_delta / swap_dt).min(120.0);
@@ -1695,6 +1741,54 @@ impl SweetEmuApp {
             }
         }
 
+        // 1b. Drive Hybrid NVIDIA CUDA 120Hz Optical-Flow Motion Synthesizer between guest swaps!
+        if got_new_frame {
+            if self.hybrid_gpu_120hz
+                && self.cuda.available
+                && !self.hle_turbo_mode
+                && !self.filter.reduce_motion
+                && !self.filter.landscape
+            {
+                let span_us = if new_frame_swap_dt > 0.012 && new_frame_swap_dt < 0.38 {
+                    ((new_frame_swap_dt * 930_000.0) as u64).clamp(36_000, 148_000)
+                } else {
+                    56_000
+                };
+                self.interp_start_instant = Instant::now();
+                self.interp_span_us = span_us;
+                self.interp_active = true;
+                self.cuda.set_temporal_alpha(40);
+            } else {
+                self.interp_active = false;
+                self.cuda.set_temporal_alpha(256);
+            }
+        } else if self.interp_active {
+            if !self.hybrid_gpu_120hz
+                || !self.cuda.available
+                || !self.cuda.last_motion_valid
+                || self.hle_turbo_mode
+                || self.filter.reduce_motion
+                || self.filter.landscape
+            {
+                self.cuda.set_temporal_alpha(256);
+                self.interp_active = false;
+                got_interp_step = true;
+            } else {
+                let el_us = self.interp_start_instant.elapsed().as_micros() as u64;
+                if el_us >= self.interp_span_us {
+                    // Settle 100% bit-exact onto raw guest Retina frame d_curr (alpha = 256)
+                    self.cuda.set_temporal_alpha(256);
+                    self.interp_active = false;
+                } else {
+                    let alpha = 40 + ((216 * el_us) / self.interp_span_us.max(1)) as u32;
+                    self.cuda.set_temporal_alpha(alpha.min(256));
+                }
+                got_interp_step = true;
+            }
+        }
+
+        let req_path = self.workspace_dir.join("qemu_run").join("capture_ui.req");
+        let capture_req = req_path.is_file();
         let periodic_chrome = self.last_chrome_refresh.elapsed().as_millis() >= 600;
         let booting_anim = !self.has_live_vm_frame
             && !self.hle_turbo_mode
@@ -1710,17 +1804,19 @@ impl SweetEmuApp {
                 || self.sim_state.timer_running);
 
         if !got_new_frame
+            && !got_interp_step
             && !got_new_logs
             && !self.ui_dirty
             && !self.chrome_dirty
             && !periodic_chrome
             && !booting_anim
             && !hle_anim_active
+            && !capture_req
         {
             return false;
         }
 
-        let need_full_chrome = self.chrome_dirty || periodic_chrome || booting_anim;
+        let need_full_chrome = self.chrome_dirty || periodic_chrome || booting_anim || capture_req;
         self.last_render_was_full_chrome = need_full_chrome;
         self.ui_dirty = false;
 
@@ -1742,8 +1838,7 @@ impl SweetEmuApp {
             // 6. Draw all interactive buttons across Left Hub, Center Pills, and Right Inspector
             self.draw_all_buttons();
 
-            let req_path = self.workspace_dir.join("qemu_run").join("capture_ui.req");
-            if req_path.is_file() {
+            if capture_req {
                 let _ = fs::remove_file(&req_path);
                 let win_bytes = bgra_u32_to_bytes(&self.backbuffer);
                 let out_png = self.workspace_dir.join("sweet_emu_window_preview.png");
@@ -1755,6 +1850,11 @@ impl SweetEmuApp {
             self.draw_center_viewport_screen_only();
         }
 
+        if got_new_frame && self.interp_active && !self.cuda.last_motion_valid {
+            self.interp_active = false;
+            self.cuda.set_temporal_alpha(256);
+        }
+
         // 7. Update honest host & guest frame rate statistics (no artificial clamping)
         let elapsed_us = frame_start.elapsed().as_micros() as u64;
         self.live_frame_us = if self.cuda.last_exec_us > 0 {
@@ -1762,15 +1862,34 @@ impl SweetEmuApp {
         } else {
             elapsed_us.max(1)
         };
+        if got_new_frame || got_interp_step || hle_anim_active {
+            if self.gpu_out_accum == 0 {
+                self.gpu_out_last_instant = Instant::now();
+            }
+            self.gpu_out_accum += 1;
+            let gdt = self.gpu_out_last_instant.elapsed().as_secs_f64();
+            if gdt >= 0.16 && self.gpu_out_accum >= 2 {
+                let inst_out = (((self.gpu_out_accum - 1) as f64) / gdt).min(144.0);
+                self.gpu_out_fps = if self.gpu_out_fps < 1.0 {
+                    inst_out
+                } else {
+                    self.gpu_out_fps * 0.45 + inst_out * 0.55
+                };
+                self.gpu_out_accum = 1;
+                self.gpu_out_last_instant = Instant::now();
+            }
+        }
         self.fps_accum_frames += 1;
         let dt = self.fps_last_instant.elapsed().as_secs_f64();
         if dt >= 0.25 {
-            self.live_fps = ((self.fps_accum_frames as f64) / dt).min(120.0);
+            self.live_fps = ((self.fps_accum_frames as f64) / dt).min(144.0);
             self.fps_accum_frames = 0;
             self.fps_last_instant = Instant::now();
         }
-        if self.last_guest_swap_instant.elapsed().as_secs_f64() > 1.5 {
+        if self.last_guest_swap_instant.elapsed().as_secs_f64() > 1.5 && !self.interp_active {
             self.guest_fps = 0.0;
+            self.gpu_out_fps = 0.0;
+            self.gpu_out_accum = 0;
         }
         true
     }
@@ -1864,7 +1983,9 @@ impl SweetEmuApp {
         fill_rounded_rect(&mut self.backbuffer, WIN_W, WIN_H, 14, 326, 230, 240, 8, 0x0010_131A);
         stroke_rounded_rect(&mut self.backbuffer, WIN_W, WIN_H, 14, 326, 230, 240, 8, 0x0026_2934);
 
-        let gpu_badge = if self.cuda.available {
+        let gpu_badge = if self.cuda.available && self.cuda.pinned_dma && self.hybrid_gpu_120hz {
+            "GPU: CUDA 120Hz PINNED DMA"
+        } else if self.cuda.available {
             "GPU: NVIDIA CUDA (ACTIVE)"
         } else {
             "GPU: CPU SIMD Fallback"
@@ -1896,8 +2017,10 @@ impl SweetEmuApp {
             24,
             372,
             &format!(
-                "VRAM: {} MB | Kernel: {} us",
-                self.cuda.vram_mb, self.cuda.last_exec_us
+                "VRAM: {}MB | Up:{:.1}ms Flow:{}us",
+                self.cuda.vram_mb,
+                (self.cuda.last_upload_us.max(self.cuda.last_exec_us) as f64) / 1000.0,
+                self.cuda.last_interp_us
             ),
             0x0038_BDF8,
             1,
@@ -1909,8 +2032,8 @@ impl SweetEmuApp {
             24,
             390,
             &format!(
-                "CUDA Launches: {}",
-                self.cuda.kernel_launches
+                "CUDA: {} frames | {} flows",
+                self.cuda.kernel_launches, self.cuda.motion_launches
             ),
             0x00CB_D5E1,
             1,
@@ -1925,8 +2048,8 @@ impl SweetEmuApp {
             24,
             420,
             &format!(
-                "Guest RAM: {} GB (QEMU 11.1)",
-                self.qemu_runner.cfg.ram_gb
+                "Guest: {} GB RAM | {}x ARM64",
+                self.qemu_runner.cfg.ram_gb, self.qemu_runner.cfg.smp
             ),
             0x00F8_FAFC,
             1,
@@ -1938,16 +2061,20 @@ impl SweetEmuApp {
             24,
             438,
             &format!(
-                "Guest SMP: {}x ARM64 Cores",
-                self.qemu_runner.cfg.smp
+                "Pipe: 4xCPU RAM + {}",
+                if self.hybrid_gpu_120hz { "CUDA 120Hz" } else { "1:1 Raw" }
             ),
             0x00F8_FAFC,
             1,
         );
         let fps_line = if self.hle_turbo_mode {
-            format!("HLE FPS: {:.1} | Swaps: {}", self.live_fps, self.boot_seq_tick)
+            format!("HLE Out: {:.0} FPS | Swaps: {}", self.live_fps, self.boot_seq_tick)
         } else if self.guest_fps >= 0.5 {
-            format!("Guest FPS: {:.1} | Swaps: {}", self.guest_fps, self.boot_seq_tick)
+            format!(
+                "Guest: {:.1} | GPU Out: {:.0} FPS",
+                self.guest_fps,
+                self.gpu_out_fps.max(self.guest_fps)
+            )
         } else {
             format!("Guest: Idle | Swaps: {}", self.boot_seq_tick)
         };
@@ -1967,14 +2094,14 @@ impl SweetEmuApp {
             WIN_H,
             24,
             474,
-            &format!("FB PA: 0x{:08x} (1080x2400)", FB_BASE),
+            &format!("FB PA: 0x{:08x} (4xCPU+DMA)", FB_BASE),
             0x0094_A3B8,
             1,
         );
         let bt = self.bridge.telemetry();
         let host_line = if bt.attached {
             format!(
-                "Host: In {}us | FB {:.1}ms | GDI {:.1}ms",
+                "Host: In {}us | FB {:.2}ms | GDI {:.1}ms",
                 bt.last_input_us,
                 (bt.last_fb_read_us as f64) / 1000.0,
                 (self.last_gdi_paint_us as f64) / 1000.0
@@ -1999,7 +2126,7 @@ impl SweetEmuApp {
             24,
             510,
             &format!(
-                "Guest HID: {:.1}ms (w={} r={})",
+                "Guest HID: {:.2}ms (w={} r={})",
                 (bt.last_guest_hid_us as f64) / 1000.0,
                 bt.mbox_w_idx,
                 bt.mbox_r_idx
@@ -2027,7 +2154,7 @@ impl SweetEmuApp {
             WIN_H,
             24,
             546,
-            "F2: HLE 120Hz | F3: 2-End Log",
+            "F2: HLE | F3: Log | F4: GPU 120Hz",
             0x0064_748B,
             1,
         );
@@ -2079,15 +2206,15 @@ impl SweetEmuApp {
         fill_rounded_rect(&mut self.backbuffer, WIN_W, WIN_H, 386, 6, 384, 32, 16, 0x001A_1D26);
         stroke_rounded_rect(&mut self.backbuffer, WIN_W, WIN_H, 386, 6, 384, 32, 16, 0x002E_3444);
         let top_title = if self.hle_turbo_mode {
-            "iPhone X • ipasim 120Hz"
+            "iPhone X • HLE"
         } else {
-            "iPhone X • iOS 16.7.16"
+            "iPhone X • iOS 16"
         };
         draw_text(
             &mut self.backbuffer,
             WIN_W,
             WIN_H,
-            398,
+            396,
             15,
             top_title,
             if self.hle_turbo_mode { 0x0034_D399 } else { 0x00F8_FAFC },
@@ -2583,6 +2710,7 @@ impl SweetEmuApp {
                 21 => self.filter.dark_mode,
                 34 => self.audio_muted,
                 35 => self.hle_turbo_mode,
+                36 => self.hybrid_gpu_120hz && !self.hle_turbo_mode,
                 _ => false,
             };
 
@@ -2865,6 +2993,7 @@ mod win32_gui {
             dw_desired_access: u32,
         ) -> *mut c_void;
         fn SetThreadDesktop(h_desktop: *mut c_void) -> i32;
+        fn PostMessageW(h_wnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -2899,6 +3028,10 @@ mod win32_gui {
         fn timeBeginPeriod(u_period: u32) -> u32;
     }
 
+    const WM_SWEET_VBLANK: u32 = 0x8001;
+    static VBLANK_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static VBLANK_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static VBLANK_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static mut GLOBAL_APP: *mut SweetEmuApp = null_mut();
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -2940,11 +3073,16 @@ mod win32_gui {
     }
 
     unsafe fn present_if_needed(hwnd: HWND, app: &mut SweetEmuApp, force_now: bool) {
-        if !force_now && app.last_present_instant.elapsed().as_millis() < 7 {
+        if !force_now && app.last_present_instant.elapsed().as_micros() < 6800 {
             return;
         }
         if app.render_full_window() {
             app.last_present_instant = Instant::now();
+            let want_120 = app.interp_active
+                || app.hle_turbo_mode
+                || app.sim_state.touch_down
+                || app.last_guest_swap_instant.elapsed().as_millis() < 450;
+            VBLANK_ACTIVE.store(want_120, std::sync::atomic::Ordering::Release);
             if app.last_render_was_full_chrome {
                 InvalidateRect(hwnd, null(), 0);
             } else {
@@ -2979,10 +3117,22 @@ mod win32_gui {
         match msg {
             WM_CREATE => {
                 let _ = timeBeginPeriod(1);
-                SetTimer(hwnd, 1, 8, null());
+                SetTimer(hwnd, 1, 32, null());
                 0
             }
             WM_ERASEBKGND => 1,
+            WM_SWEET_VBLANK => {
+                VBLANK_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+                if !app_ptr.is_null() {
+                    present_if_needed(hwnd, &mut *app_ptr, true);
+                    let want_120 = (*app_ptr).interp_active
+                        || (*app_ptr).hle_turbo_mode
+                        || (*app_ptr).sim_state.touch_down
+                        || (*app_ptr).last_guest_swap_instant.elapsed().as_millis() < 450;
+                    VBLANK_ACTIVE.store(want_120, std::sync::atomic::Ordering::Release);
+                }
+                0
+            }
             WM_TIMER => {
                 if !app_ptr.is_null() {
                     present_if_needed(hwnd, &mut *app_ptr, true);
@@ -2993,12 +3143,16 @@ mod win32_gui {
                 if !app_ptr.is_null() {
                     let (bx, by) = client_to_backbuffer(hwnd, l_param);
                     (*app_ptr).on_mouse_move(bx, by);
+                    if (*app_ptr).sim_state.touch_down {
+                        VBLANK_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     present_if_needed(hwnd, &mut *app_ptr, false);
                 }
                 0
             }
             WM_LBUTTONDOWN => {
                 if !app_ptr.is_null() {
+                    VBLANK_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
                     let (bx, by) = client_to_backbuffer(hwnd, l_param);
                     (*app_ptr).on_mouse_down(bx, by, hwnd as usize);
                     present_if_needed(hwnd, &mut *app_ptr, true);
@@ -3040,23 +3194,29 @@ mod win32_gui {
                         (*app_ptr).execute_button_action(35, hwnd as usize);
                         present_if_needed(hwnd, &mut *app_ptr, true);
                     } else if w_param as u32 == 0x72 {
-                        // F3 -> Log live Two-Ended Host<->Guest pipeline latency breakdown
+                        // F3 -> Log live Two-Ended Host<->Guest + Hybrid CUDA 120Hz latency breakdown
                         let bt = (*app_ptr).bridge.telemetry();
-                        let cuda_us = (*app_ptr).cuda.last_exec_us;
+                        let up_us = (*app_ptr).cuda.last_upload_us.max((*app_ptr).cuda.last_exec_us);
+                        let flow_us = (*app_ptr).cuda.last_interp_us;
                         let gdi_us = (*app_ptr).last_gdi_paint_us;
+                        let out_fps = (*app_ptr).gpu_out_fps.max((*app_ptr).guest_fps);
                         (*app_ptr).log(format!(
-                            "[2-END] Host(In={}us FB={:.2}ms CUDA={:.2}ms GDI={:.2}ms) | Guest(HID={:.2}ms SwapDt={:.1}ms E2E={:.1}ms w={} r={})",
+                            "[2-END] Host(In={}us 4xFB={:.2}ms Up={:.2}ms Flow={}us GDI={:.2}ms Out={:.0}fps) | Guest(HID={:.2}ms SwapDt={:.1}ms E2E={:.1}ms)",
                             bt.last_input_us,
                             (bt.last_fb_read_us as f64) / 1000.0,
-                            (cuda_us as f64) / 1000.0,
+                            (up_us as f64) / 1000.0,
+                            flow_us,
                             (gdi_us as f64) / 1000.0,
+                            out_fps,
                             (bt.last_guest_hid_us as f64) / 1000.0,
                             (bt.last_swap_interval_us as f64) / 1000.0,
-                            (bt.last_e2e_photon_us as f64) / 1000.0,
-                            bt.mbox_w_idx,
-                            bt.mbox_r_idx
+                            (bt.last_e2e_photon_us as f64) / 1000.0
                         ));
                         (*app_ptr).chrome_dirty = true;
+                        present_if_needed(hwnd, &mut *app_ptr, true);
+                    } else if w_param as u32 == 0x73 {
+                        // F4 -> Toggle Hybrid CPU+GPU 120Hz Pinned-DMA Optical-Flow Synthesis
+                        (*app_ptr).execute_button_action(36, hwnd as usize);
                         present_if_needed(hwnd, &mut *app_ptr, true);
                     }
                 }
@@ -3182,6 +3342,7 @@ mod win32_gui {
             WM_DESTROY => {
                 // Keep background QEMU VM alive across GUI restarts for <1ms instant re-attach
                 // (use the explicit 'Stop VM' button in Device Hub to shut down QEMU).
+                VBLANK_EXIT.store(true, std::sync::atomic::Ordering::Release);
                 KillTimer(hwnd, 1);
                 PostQuitMessage(0);
                 0
@@ -3336,6 +3497,47 @@ mod win32_gui {
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
             UpdateWindow(hwnd);
+
+            // Spawn dedicated 120Hz (8.33ms) VBlank Pacer bypassing Win32 USER_TIMER_MINIMUM (10..15.6ms)
+            VBLANK_EXIT.store(false, std::sync::atomic::Ordering::Release);
+            VBLANK_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+            let hwnd_usize = hwnd as usize;
+            let bridge_state = app.bridge.state.clone();
+            let _ = std::thread::Builder::new()
+                .name("sweet-120hz-vblank".into())
+                .spawn(move || {
+                    let mut next_tick = Instant::now();
+                    while !VBLANK_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+                        let has_new_fb = bridge_state
+                            .try_lock()
+                            .map(|st| st.new_frame_ready)
+                            .unwrap_or(false);
+                        if VBLANK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) || has_new_fb {
+                            let now = Instant::now();
+                            if now < next_tick && !has_new_fb {
+                                let rem = next_tick - now;
+                                if rem.as_micros() > 1400 {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                                continue;
+                            }
+                            next_tick = Instant::now() + std::time::Duration::from_micros(8_333);
+                            if !VBLANK_QUEUED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                let _ = PostMessageW(
+                                    hwnd_usize as HWND,
+                                    WM_SWEET_VBLANK,
+                                    0,
+                                    0,
+                                );
+                            }
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(4));
+                            next_tick = Instant::now();
+                        }
+                    }
+                });
 
             let mut msg: MSG = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

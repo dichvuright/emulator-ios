@@ -811,12 +811,12 @@ impl SweetBridgeService {
                             }
                         }
 
-                        let wait_ms = if metrics_fb.pending_hid_ack.load(Ordering::Relaxed) {
-                            1
+                        if metrics_fb.pending_hid_ack.load(Ordering::Relaxed) {
+                            thread::yield_now();
+                            thread::sleep(Duration::from_micros(400));
                         } else {
-                            2
-                        };
-                        thread::sleep(Duration::from_millis(wait_ms));
+                            thread::sleep(Duration::from_millis(1));
+                        }
                     }
                 });
         }

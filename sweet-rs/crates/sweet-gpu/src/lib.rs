@@ -774,8 +774,8 @@ mod tests {
     fn test_cuda_accelerator_and_filters() {
         let mut cuda = CudaAccelerator::new();
         println!(
-            "CUDA status: available={}, device={}, vram={} MB",
-            cuda.available, cuda.device_name, cuda.vram_mb
+            "CUDA status: available={}, pinned_dma={}, device={}, vram={} MB",
+            cuda.available, cuda.pinned_dma, cuda.device_name, cuda.vram_mb
         );
         let guest_bgra = vec![0x80u8; 1080 * 2400 * 4];
         let mut win_px = vec![0u32; 400 * 800];
@@ -784,5 +784,232 @@ mod tests {
         filter.increase_contrast = true;
         cuda.blit_guest_fb_filtered(&mut win_px, 400, 800, 20, 20, 324, 720, &guest_bgra, &filter);
         assert_ne!(win_px[100 * 400 + 100], 0);
+    }
+
+    #[test]
+    fn test_cuda_motion_and_pinned_dma() {
+        let mut cuda = CudaAccelerator::new();
+        let w = 1080usize;
+        let h = 2400usize;
+        let mut frame0 = vec![0x1Cu8; w * h * 4];
+        let mut frame1 = vec![0x1Cu8; w * h * 4];
+
+        // Draw high-contrast Settings-like rows at y0 = 600..624 in frame0
+        // and scrolled up by 48 px to y1 = 552..576 in frame1 (mv_y = -48).
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                frame0[i + 3] = 0xFF;
+                frame1[i + 3] = 0xFF;
+                if (600..624).contains(&y) && (120..960).contains(&x) {
+                    let v = if ((x / 16) & 1) == 0 { 0xF0 } else { 0x38 };
+                    frame0[i] = v;
+                    frame0[i + 1] = v;
+                    frame0[i + 2] = v;
+                }
+                if (552..576).contains(&y) && (120..960).contains(&x) {
+                    let v = if ((x / 16) & 1) == 0 { 0xF0 } else { 0x38 };
+                    frame1[i] = v;
+                    frame1[i + 1] = v;
+                    frame1[i + 2] = v;
+                }
+            }
+        }
+
+        let mut win_px = vec![0u32; 720 * 1600];
+        let filter = DisplayFilterConfig::default();
+
+        // Upload frame 0 (initializes d_curr)
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(256);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &frame0, &filter);
+
+        // Upload frame 1 (swaps d_prev <-> d_curr, runs sweet_motion_kernel + sweet_fb_kernel at alpha=128)
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(128);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &frame1, &filter);
+        let upload_and_motion_us = cuda.last_exec_us;
+        // At alpha=128 (halfway between y0=600..624 and y1=552..576 -> sy=588 -> oy=392, ox=152 -> sx=228):
+        // Pure cross-fade without optical flow would yield background 0x1C; optical flow yields ~0xF0!
+        let mid_flow_luma = win_px[392 * 720 + 152] & 0xFF;
+
+        // Synthesize intermediate 120Hz frames straight from VRAM (zero 10.36 MB PCIe HtoD upload!)
+        for alpha in [64u32, 96, 128, 160, 192, 224, 256] {
+            cuda.set_temporal_alpha(alpha);
+            cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &frame1, &filter);
+        }
+        let vram_interp_us = cuda.last_interp_us;
+
+        println!(
+            "Hybrid CUDA 120Hz bench: avail={}, pinned={}, motion_launches={}, kernel_launches={}, upload+flow={} us, vram_120hz_step={} us, mid_flow_luma=0x{:02x}",
+            cuda.available,
+            cuda.pinned_dma,
+            cuda.motion_launches,
+            cuda.kernel_launches,
+            upload_and_motion_us,
+            vram_interp_us,
+            mid_flow_luma
+        );
+
+        if cuda.available {
+            assert!(cuda.pinned_dma, "RTX 5050 should enable pinned PCIe DMA");
+            assert!(cuda.motion_launches >= 1, "sweet_motion_kernel must execute");
+            assert!(cuda.kernel_launches >= 8, "sweet_fb_kernel must execute for each alpha step");
+            assert!(
+                mid_flow_luma > 0xC0,
+                "Optical flow at alpha=128 must warp scrolled row to halfway oy=392 (got 0x{:02x})",
+                mid_flow_luma
+            );
+        }
+        // At alpha=256, scrolled bar should sit cleanly around oy = 564 * 1600 / 2400 = 376, ox = 152
+        let settled_luma = win_px[376 * 720 + 152] & 0xFF;
+        assert!(settled_luma > 0xC0, "Settled frame at alpha=256 must match frame1 row (got 0x{:02x})", settled_luma);
+    }
+
+    #[test]
+    fn test_no_red_stripe_corruption_at_low_alpha() {
+        let mut cuda = CudaAccelerator::new();
+        let w = 1080usize;
+        let h = 2400usize;
+        let mut filter = DisplayFilterConfig::default();
+        filter.dark_mode = true; // pack_gpu_flags() == 0 so raw RGB comes straight out of sweet_fb_kernel
+        let mut win_px = vec![0u32; 720 * 1600];
+
+        // Case A: Non-rigid UI transition / tap (valid == 0) at alpha = 40, 64, 96, 120 (< 128)
+        // Previously, SAMPLE_CURR_ONLY left %p4 = false and %r60..%r62 uninitialized, overwriting
+        // the entire screen with 4.2 vertical red/teal register-file stripes whenever alpha < 128!
+        let mut cut0 = vec![0x18u8; w * h * 4];
+        let mut cut1 = vec![0x24u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                cut0[i + 3] = 0xFF;
+                cut1[i + 3] = 0xFF;
+                // Opposite-moving modal blocks so no global rigid (dx, dy) exists -> valid == 0
+                if (500..900).contains(&y) && (200..880).contains(&x) {
+                    cut0[i] = 0xE0;
+                    cut0[i + 1] = 0xE0;
+                    cut0[i + 2] = 0xE0;
+                }
+                if (1200..1700).contains(&y) && (140..940).contains(&x) && ((x + y) % 19 < 7) {
+                    cut1[i] = 0xD8;
+                    cut1[i + 1] = 0xD8;
+                    cut1[i + 2] = 0xD8;
+                }
+            }
+        }
+
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(40); // Even first frame with alpha=40 must force run_alpha=256 cleanly!
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &cut0, &filter);
+        for oy in 0..300usize {
+            for ox in 0..720usize {
+                let px = win_px[oy * 720 + ox];
+                let r = ((px >> 16) & 0xFF) as i32;
+                let g = ((px >> 8) & 0xFF) as i32;
+                let b = (px & 0xFF) as i32;
+                assert!(
+                    (r - 0x18).abs() <= 1 && (g - 0x18).abs() <= 1 && (b - 0x18).abs() <= 1,
+                    "First frame corruption at ({}, {}): 0x{:08x}",
+                    ox,
+                    oy,
+                    px
+                );
+            }
+        }
+
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(40);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &cut1, &filter);
+        if cuda.available {
+            assert!(!cuda.last_motion_valid, "Non-rigid cut must report last_motion_valid == false");
+        }
+        for alpha in [40u32, 64, 96, 120] {
+            cuda.set_temporal_alpha(alpha);
+            cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &cut1, &filter);
+            for oy in 0..750usize {
+                for ox in 0..720usize {
+                    let px = win_px[oy * 720 + ox];
+                    let r = ((px >> 16) & 0xFF) as i32;
+                    let g = ((px >> 8) & 0xFF) as i32;
+                    let b = (px & 0xFF) as i32;
+                    assert!(
+                        (r - 0x24).abs() <= 1 && (g - 0x24).abs() <= 1 && (b - 0x24).abs() <= 1,
+                        "Red-stripe corruption on non-rigid cut at alpha={}, ({}, {}): 0x{:08x}",
+                        alpha,
+                        ox,
+                        oy,
+                        px
+                    );
+                }
+            }
+        }
+
+        // Case B: Coherent vertical scroll (valid == 1, mv_y = -48) at alpha = 40, 64, 96 (< 128)
+        // Verify Status Bar (sy < 128), Nav Bar (sy < 268), Nav seam, and Home Indicator (sy >= 2300)
+        // have ZERO red stripes while the scrolled content band warps cleanly at alpha = 64!
+        cuda.reset_motion_history();
+        let mut sc0 = vec![0x1Cu8; w * h * 4];
+        let mut sc1 = vec![0x1Cu8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                sc0[i + 3] = 0xFF;
+                sc1[i + 3] = 0xFF;
+                if (600..624).contains(&y) && (120..960).contains(&x) {
+                    let v = if ((x / 16) & 1) == 0 { 0xF0 } else { 0x38 };
+                    sc0[i] = v;
+                    sc0[i + 1] = v;
+                    sc0[i + 2] = v;
+                }
+                if (552..576).contains(&y) && (120..960).contains(&x) {
+                    let v = if ((x / 16) & 1) == 0 { 0xF0 } else { 0x38 };
+                    sc1[i] = v;
+                    sc1[i + 1] = v;
+                    sc1[i + 2] = v;
+                }
+            }
+        }
+
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(256);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &sc0, &filter);
+
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(40);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &sc1, &filter);
+        if cuda.available {
+            assert!(cuda.last_motion_valid, "Coherent scroll must set last_motion_valid == true");
+            assert_eq!(cuda.last_mv_y, -48, "Coherent scroll must detect mv_y == -48");
+        }
+        // Check static chrome bands (oy = 0..220 -> sy = 0..330, and oy = 1520..1600 -> sy = 2280..2400)
+        // plus interior dark region (oy = 600..1200) at alpha = 40 (< 128)!
+        for oy in (0..220usize).chain(600..1200usize).chain(1520..1600usize) {
+            for ox in 0..720usize {
+                let px = win_px[oy * 720 + ox];
+                let r = ((px >> 16) & 0xFF) as i32;
+                let g = ((px >> 8) & 0xFF) as i32;
+                let b = (px & 0xFF) as i32;
+                assert!(
+                    (r - 0x1C).abs() <= 1 && (g - 0x1C).abs() <= 1 && (b - 0x1C).abs() <= 1,
+                    "Red-stripe corruption during scroll at alpha=40, ({}, {}): 0x{:08x}",
+                    ox,
+                    oy,
+                    px
+                );
+            }
+        }
+
+        // At alpha = 64 (25% along -48 px scroll -> y = 612 - 12 = 600 -> oy = 400, ox = 152):
+        cuda.set_temporal_alpha(64);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &sc1, &filter);
+        if cuda.available {
+            let quarter_luma = win_px[400 * 720 + 152] & 0xFF;
+            assert!(
+                quarter_luma > 0xC0,
+                "Optical flow at alpha=64 (<128) must warp cleanly to oy=400 (got 0x{:02x})",
+                quarter_luma
+            );
+        }
     }
 }
