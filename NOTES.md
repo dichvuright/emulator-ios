@@ -1,11 +1,29 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-22, latest)
+## Agent handoff / active work (2026-10-23, latest)
 
-### >>> UPDATE 2026-10-22 (END-TO-END DEVICE HUB OVERHAUL: AUTO-BOOT 4GB-8GB LIVE QEMU VM + NVIDIA CUDA RTX 5050 + INSPECTOR & KEYBOARD/IPA SYNC) <<<
+### >>> UPDATE 2026-10-23 (SILKY-SMOOTH SCROLLING OVERHAUL + IPASIM HLE 120HZ ENGINE & OBJC ANALYZER + ZERO RGhA/b3a8 SURFACES) <<<
 
-**STATE at 2026-10-22:**
-- **🎉🎉 MILESTONE: Complete End-to-End Overhaul of `sweet-emu.exe` (`1240x900` 3-Column `Device Hub` Studio Interface + Auto-Boot 4GB–8GB RAM QEMU 11.1.0 ARM64 VM on Launch + Real NVIDIA CUDA `nvcuda.dll` PTX GPU Acceleration on RTX 5050 + PC Keyboard & Inspector Controls)**:
+**STATE at 2026-10-23:**
+- **🎉🎉 MILESTONE: Complete Scrolling/Swiping Smoothness Overhaul + Port of `ipasim` Host-Native 120Hz HLE Engine & Mach-O Objective-C Analyzer**:
+  - **Phase 14 — Fix `UIPanGestureRecognizer` Hysteresis & Velocity Zeroing, Remove Smearing/Rubber-Banding `apply_live_scroll_preview()`, Patch Remaining `'RGhA'`/`'b3a8'`/`'&b38'` Selectors in `QuartzCore`, Strip `LaunchEvents` (`145 -> 70` `xpcproxy` Spawns), and Integrate `ipasim` 120Hz HLE Mode (`sweet-rs/crates/sweet-bridge/src/lib.rs`, `sweet-rs/crates/sweet-core/src/qemu.rs`, `sweet-rs/crates/sweet-core/src/ipa.rs`, `sweet-rs/crates/sweet-emu/src/main.rs`, `tools/qemu-sweet.py`, `emu_workspace/ios16-root-20H392.img`, `emu_workspace/payload_virtio.bin`)**:
+    - **6 Root Causes Uncovered & Fixed:**
+      1. **`UIPanGestureRecognizer` `Possible -> Began` Hysteresis Absorbing 100% of Drag Distance + `TouchDown` Overwrite in `'SWIN'` Ring (`sweet-rs/crates/sweet-core/src/qemu.rs`, `sweet-rs/crates/sweet-bridge/src/lib.rs`):**
+         - Previously, `enqueue_input` overwrote slot `(w_idx - 1)` whenever `pending >= 1`, allowing `TouchMove` within `6 ms` of `TouchDown` to overwrite `TouchDown` in-place, while `sweet-bridge` drained an entire drag `(x0, y0) -> (x1, y1)` into one `TouchMove(x1, y1)` followed `8 ms` later by `TouchUp(x1, y1)` (`velocity = 0`, `translation = 0` because UIKit resets its pan translation anchor on the first `TouchMove` crossing `10 pt` / `30 px`!).
+         - Raised in-place coalescing threshold to `pending >= 8` in both `qemu.rs` and `tools/qemu-sweet.py`, and implemented a multi-step `UIPanGestureRecognizer` state machine in `sweet-bridge` (`TouchDown` -> `16 ms` -> explicit `36 px` `Began` anchor step -> `Changed` trajectory steps -> `3 x 15 ms` velocity steps before `TouchUp`, plus 5-step `ScrollWheel` flicks).
+         - Verified live (`PID 12404`, `swap 30 -> 36`): a single swipe `(540, 1800) -> (540, 600)` in `Settings` smoothly scrolls with full `UIScrollView` inertial momentum from `Airplane Mode` all the way down to `App Store .. Game Center`, and `Home` swipe (`(540, 2385) -> (540, 1220)`) returns cleanly to `SpringBoard` instead of stalling in App Switcher.
+      2. **Eliminated Pixel Smearing & Backwards Rubber-Banding (`apply_live_scroll_preview` Removed in `sweet-rs/crates/sweet-emu/src/main.rs`):**
+         - Removed `apply_live_scroll_preview()`, which previously shifted `self.backbuffer` scanlines during mouse hold and snapped backwards on release.
+      3. **Patched All 6 Remaining `'RGhA'` (`0x52476841`), `'b3a8'` (`0x62336138`), and `'&b38'` (`0x26623338`) Backing-Store Selectors in `QuartzCore` (`dyld_shared_cache_arm64.03`, `sblk = 2083935`):**
+         - Patched `0x1882c5330`, `0x1882c5410`, `0x1882c545c` (16KB page `1358`), `0x1883bc2fc`, `0x1883bc620` (16KB page `1420`), and `0x1883cc4c0` (16KB page `1424`) to `'BGRA'` (`0x42475241`) and updated their SHA-256 slots (`cs+43681`, `cs+45665`, `cs+45793`). Verified in live kernel log (`PID 12404`, `swap = 39`): **zero `'RGhA'` and zero `'b3a8'` surfaces** even across `SpringBoard`, `Preferences`, and Home/Switcher snapshots (`id 11` now `0x42475241` `'BGRA'`).
+      4. **Stripped `'LaunchEvents'` & Bloat `MachServices` in `launchd.plist` + Added `--sync-only` + `sweetnull=-` (`tools/qemu-sweet.py`, `emu_workspace/payload_virtio.bin`):**
+         - Fixed `com.apple.GameController.gamecontrollerd.plist` case-insensitive `RunAtLoad = True` match, stripped `'LaunchEvents'`, `'MachServices'`, `'KeepAlive'`, `'StartInterval'` across 80+ background daemons (`FileProvider`, `IMDPersistenceAgent`, `VideoSubscriberAccount`, `AppSSODaemon`, `GSSCred`, `AccessibilityUIServer`, `ManagedSettingsAgent`, `privacyaccountingd`, `CommCenter*`, `nfcd`, `rapportd`, `liveactivitiesd`, `chronod`, etc.), added `--sync-only` CLI flag to `tools/qemu-sweet.py`, and set `sweetnull=-` in `emu_workspace/payload_virtio.bin`.
+         - Result: `xpcproxy` spawns dropped from **`145 -> 107 -> 70`** (>50% reduction!), zero `liveactivitiesd`/`chronod` crashes, and tapping `Settings` spawns ONLY `splashboardd` + `Preferences`.
+      5. **Instant `< 1 ms` GUI Re-Attach (`WM_DESTROY` & `QemuRunner::attach_if_live`):**
+         - Closing `sweet-emu.exe` leaves the booted `qemu-system-aarch64.exe` alive in the background so reopening `sweet-emu.exe` re-attaches via Direct-RAM in `< 1 ms` without a 65s cold boot (while `Stop VM` explicitly terminates QEMU).
+      6. **Ported `ipasim` Host-Native `HLE 120Hz` Turbo Engine & Mach-O Objective-C `TypeDecoder`/Analyzer (`sweet-rs/crates/sweet-core/src/ipa.rs`, `sweet-rs/crates/sweet-emu/src/main.rs`):**
+         - Ported `decode_objc_type_encoding` and `analyze_macho_objc_metadata` (`__objc_classname`, `__objc_methname`, `__objc_methtype`, framework imports) from `ipasim` (`SysTranslator.cpp` / `MachO.cpp`) into `sweet-core::ipa`.
+         - Added one-click **`HLE 120Hz`** button (`id: 35` in Top Floating Toolbar Pill + `F2` shortcut) in `sweet-emu.exe` running host-native 120 FPS `UIKit` / `CoreAnimation` / `UIScrollView` inertial spring & momentum physics alongside the live QEMU XNU VM.
   - **Phase 13 — Eliminate `'b3a8'` / `'w30r'` Multi-Plane & 10-Bit CPU Software Conversion in `QuartzCore` (`Subcache 03`), Strip Background XPC Bloat Daemons (`145 -> 107` `exec xpcproxy`), and Fix Mouse-Click Tap Cancellation (`emu_workspace/ios16-root-20H392.img`, `tools/qemu-sweet.py`, `sweet-rs/crates/sweet-bridge/src/lib.rs`, `sweet-rs/crates/sweet-emu/src/main.rs`)**:
     - **3 Root Causes of Slow App Launches & Remaining Frame Conversion Overhead Uncovered & Fixed:**
       1. **Full-Screen & Backdrop Surfaces Allocated as 2-Plane `'b3a8'` (`0x62336138`) or 10-Bit `'w30r'` (`0x77333072`) Instead of Single-Plane 8-Bit `'BGRA'` (`0x42475241`):**

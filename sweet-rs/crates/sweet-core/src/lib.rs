@@ -7,9 +7,10 @@ pub use adt::{
     build_qemu_adt, build_sweet_adt, parse_adt, serialize_adt, AdtNode, AdtProperty,
 };
 pub use ipa::{
-    build_demo_macho_executable, build_trustcache_v1, create_demo_ipa, extract_codesig_cdhash,
-    inspect_app_or_ipa, install_app_to_root, list_installed_apps, parse_macho_binary,
-    parse_plist_kv, parse_trustcache_v1, read_stored_zip, write_stored_zip,
+    analyze_macho_objc_metadata, build_demo_macho_executable, build_trustcache_v1, create_demo_ipa,
+    decode_objc_type_encoding, extract_codesig_cdhash, inspect_app_or_ipa, install_app_to_root,
+    list_installed_apps, parse_macho_binary, parse_plist_kv, parse_trustcache_v1, read_stored_zip,
+    write_stored_zip, IpasimMachOAnalysis, IpasimObjcMethod,
 };
 pub use qemu::{
     build_qemu_args, direct_qemu_attachment_info, direct_qemu_enqueue_input,

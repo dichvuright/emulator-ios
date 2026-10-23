@@ -211,7 +211,13 @@ impl SweetBridgeService {
                     let mut last_down_instant = Instant::now();
                     let mut last_move_instant = Instant::now();
                     let mut last_move_swap: u32 = 0;
-                    let mut moves_since_down: u32 = 0;
+                    let mut down_x: i32 = 540;
+                    let mut down_y: i32 = 1200;
+                    let mut last_dispatched_x: i32 = 540;
+                    let mut last_dispatched_y: i32 = 1200;
+                    let mut last_step_dx: i32 = 0;
+                    let mut last_step_dy: i32 = 0;
+                    let mut began_sent: bool = false;
                     let mut pending_cmd: Option<BridgeInputCmd> = None;
                     loop {
                         let cmd = if let Some(c) = pending_cmd.take() {
@@ -228,7 +234,13 @@ impl SweetBridgeService {
                                 last_down_instant = Instant::now();
                                 last_move_instant = last_down_instant;
                                 last_move_swap = metrics_in.swap_count.load(Ordering::Relaxed);
-                                moves_since_down = 0;
+                                down_x = nx;
+                                down_y = ny;
+                                last_dispatched_x = nx;
+                                last_dispatched_y = ny;
+                                last_step_dx = 0;
+                                last_step_dy = 0;
+                                began_sent = false;
                                 dispatch_raw_input(1, finger, true, nx, ny, Some(&metrics_in));
                             }
                             BridgeInputCmd::TouchMove {
@@ -236,8 +248,8 @@ impl SweetBridgeService {
                                 mut x,
                                 mut y,
                             } => {
-                                // Drain any back-to-back TouchMove commands queued in the channel so we always
-                                // send only the latest cursor coordinate.
+                                // Drain back-to-back TouchMove commands queued in the channel,
+                                // stopping immediately if TouchUp or another command arrives.
                                 while let Ok(next_c) = input_rx.try_recv() {
                                     match next_c {
                                         BridgeInputCmd::TouchMove {
@@ -254,19 +266,60 @@ impl SweetBridgeService {
                                         }
                                     }
                                 }
-                                let cur_swap = metrics_in.swap_count.load(Ordering::Relaxed);
-                                let elapsed_ms = last_move_instant.elapsed().as_millis() as u64;
-                                // Send initial move immediately to engage UIScrollView pan, then pace subsequent
-                                // moves to guest frame swaps (or 28ms max) so backboardd/UIKit aren't flooded at 250Hz.
-                                if moves_since_down < 2
-                                    || cur_swap != last_move_swap
-                                    || elapsed_ms >= 28
-                                    || pending_cmd.is_some()
-                                {
-                                    last_move_instant = Instant::now();
-                                    last_move_swap = cur_swap;
-                                    moves_since_down = moves_since_down.saturating_add(1);
-                                    dispatch_raw_input(1, finger, true, x, y, Some(&metrics_in));
+
+                                // 1. UIPanGestureRecognizer Possible -> Began anchor step (36 iOS px):
+                                // UIKit resets its pan translation origin to whichever TouchMove first crosses
+                                // its 10pt (30px) hysteresis threshold. Sending an explicit 36px step first
+                                // preserves ~95% of the user's swipe distance as real scroll translation!
+                                if !began_sent {
+                                    let dx = x - down_x;
+                                    let dy = y - down_y;
+                                    let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                                    if dist >= 34.0 {
+                                        let since_down = last_down_instant.elapsed().as_millis() as u64;
+                                        if since_down < 16 {
+                                            thread::sleep(Duration::from_millis(16 - since_down));
+                                        }
+                                        let scale = (36.0 / dist).min(0.5);
+                                        let bx = (down_x + ((dx as f32) * scale).round() as i32).clamp(0, 1079);
+                                        let by = (down_y + ((dy as f32) * scale).round() as i32).clamp(0, 2399);
+                                        dispatch_raw_input(1, finger, true, bx, by, Some(&metrics_in));
+                                        thread::sleep(Duration::from_millis(16));
+                                        began_sent = true;
+                                        last_step_dx = bx - last_dispatched_x;
+                                        last_step_dy = by - last_dispatched_y;
+                                        last_dispatched_x = bx;
+                                        last_dispatched_y = by;
+                                        last_move_instant = Instant::now();
+                                        last_move_swap = metrics_in.swap_count.load(Ordering::Relaxed);
+                                    }
+                                }
+
+                                // If TouchUp is already queued right behind this move (fast flick), let TouchUp
+                                // emit the multi-step velocity trajectory to (x, y) cleanly.
+                                if began_sent && pending_cmd.is_none() {
+                                    let cur_swap = metrics_in.swap_count.load(Ordering::Relaxed);
+                                    let elapsed_ms = last_move_instant.elapsed().as_millis() as u64;
+                                    let step_dx = x - last_dispatched_x;
+                                    let step_dy = y - last_dispatched_y;
+                                    let step_manhattan = step_dx.abs() + step_dy.abs();
+                                    if step_manhattan >= 8
+                                        && ((cur_swap != last_move_swap && elapsed_ms >= 14) || elapsed_ms >= 22)
+                                    {
+                                        if step_manhattan >= 180 {
+                                            let mx = (last_dispatched_x + x) / 2;
+                                            let my = (last_dispatched_y + y) / 2;
+                                            dispatch_raw_input(1, finger, true, mx, my, Some(&metrics_in));
+                                            thread::sleep(Duration::from_millis(14));
+                                        }
+                                        dispatch_raw_input(1, finger, true, x, y, Some(&metrics_in));
+                                        last_step_dx = step_dx;
+                                        last_step_dy = step_dy;
+                                        last_dispatched_x = x;
+                                        last_dispatched_y = y;
+                                        last_move_instant = Instant::now();
+                                        last_move_swap = cur_swap;
+                                    }
                                 }
                             }
                             BridgeInputCmd::TouchUp {
@@ -296,10 +349,58 @@ impl SweetBridgeService {
                                         Some(&metrics_in),
                                     );
                                 } else {
-                                    // Drag/swipe release: commit final position before lift so momentum scroll starts cleanly
-                                    dispatch_raw_input(1, finger, true, x, y, Some(&metrics_in));
-                                    thread::sleep(Duration::from_millis(8));
-                                    dispatch_raw_input(1, finger, false, x, y, Some(&metrics_in));
+                                    // Ensure Began anchor step was emitted even on ultra-fast 1-frame mouse flicks
+                                    if !began_sent {
+                                        let dx = x - down_x;
+                                        let dy = y - down_y;
+                                        let dist = ((dx * dx + dy * dy) as f32).sqrt().max(1.0);
+                                        let since_down = last_down_instant.elapsed().as_millis() as u64;
+                                        if since_down < 16 {
+                                            thread::sleep(Duration::from_millis(16 - since_down));
+                                        }
+                                        let scale = (36.0 / dist).min(0.4);
+                                        let bx = (down_x + ((dx as f32) * scale).round() as i32).clamp(0, 1079);
+                                        let by = (down_y + ((dy as f32) * scale).round() as i32).clamp(0, 2399);
+                                        dispatch_raw_input(1, finger, true, bx, by, Some(&metrics_in));
+                                        thread::sleep(Duration::from_millis(16));
+                                        began_sent = true;
+                                        last_dispatched_x = bx;
+                                        last_dispatched_y = by;
+                                    }
+
+                                    let rem_dx = x - last_dispatched_x;
+                                    let rem_dy = y - last_dispatched_y;
+                                    let rem_manhattan = rem_dx.abs() + rem_dy.abs();
+                                    let mut end_x = x.clamp(0, 1079);
+                                    let mut end_y = y.clamp(0, 2399);
+
+                                    if rem_manhattan >= 24 {
+                                        // 3 evenly-spaced Changed steps @ 16ms so _UIVelocityIntegrator registers
+                                        // full pan translation AND strong flick velocity for momentum scroll & Home swipe!
+                                        for step in 1..=3 {
+                                            let sx = (last_dispatched_x + (rem_dx * step) / 3).clamp(0, 1079);
+                                            let sy = (last_dispatched_y + (rem_dy * step) / 3).clamp(0, 2399);
+                                            dispatch_raw_input(1, finger, true, sx, sy, Some(&metrics_in));
+                                            thread::sleep(Duration::from_millis(15));
+                                        }
+                                    } else if last_move_instant.elapsed().as_millis() < 65
+                                        && (last_step_dx.abs() + last_step_dy.abs()) >= 16
+                                    {
+                                        // Cursor released while still moving, with last move already at (x, y):
+                                        // emit a small continuation step so TouchUp does not collapse velocity to 0!
+                                        let step_len = ((last_step_dx * last_step_dx + last_step_dy * last_step_dy) as f32)
+                                            .sqrt()
+                                            .max(1.0);
+                                        end_x = (x + ((last_step_dx as f32 / step_len) * 28.0).round() as i32)
+                                            .clamp(0, 1079);
+                                        end_y = (y + ((last_step_dy as f32 / step_len) * 28.0).round() as i32)
+                                            .clamp(0, 2399);
+                                        dispatch_raw_input(1, finger, true, end_x, end_y, Some(&metrics_in));
+                                        thread::sleep(Duration::from_millis(14));
+                                    } else {
+                                        thread::sleep(Duration::from_millis(12));
+                                    }
+                                    dispatch_raw_input(1, finger, false, end_x, end_y, Some(&metrics_in));
                                 }
                             }
                             BridgeInputCmd::Tap { x, y, hold_ms } => {
@@ -309,18 +410,33 @@ impl SweetBridgeService {
                                 dispatch_raw_input(1, 0, false, nx, ny, Some(&metrics_in));
                             }
                             BridgeInputCmd::Swipe { points, step_ms } => {
-                                if let Some(&(last_x, last_y)) = points.last() {
-                                    let wait = step_ms.max(10);
-                                    for &(px, py) in &points {
-                                        dispatch_raw_input(1, 0, true, px, py, Some(&metrics_in));
+                                if let Some(&(first_x, first_y)) = points.first() {
+                                    if let Some(&(last_x, last_y)) = points.last() {
+                                        let wait = step_ms.max(15);
+                                        dispatch_raw_input(1, 0, true, first_x, first_y, Some(&metrics_in));
                                         thread::sleep(Duration::from_millis(wait));
+                                        let dx = last_x - first_x;
+                                        let dy = last_y - first_y;
+                                        let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                                        if dist >= 40.0 {
+                                            let bx = (first_x + ((dx as f32 / dist) * 36.0).round() as i32)
+                                                .clamp(0, 1079);
+                                            let by = (first_y + ((dy as f32 / dist) * 36.0).round() as i32)
+                                                .clamp(0, 2399);
+                                            dispatch_raw_input(1, 0, true, bx, by, Some(&metrics_in));
+                                            thread::sleep(Duration::from_millis(wait));
+                                        }
+                                        for &(px, py) in points.iter().skip(1) {
+                                            dispatch_raw_input(1, 0, true, px, py, Some(&metrics_in));
+                                            thread::sleep(Duration::from_millis(wait));
+                                        }
+                                        dispatch_raw_input(1, 0, false, last_x, last_y, Some(&metrics_in));
                                     }
-                                    dispatch_raw_input(1, 0, false, last_x, last_y, Some(&metrics_in));
                                 }
                             }
                             BridgeInputCmd::ScrollWheel { mut delta } => {
-                                // Coalesce all queued mouse wheel notches into a single flick gesture
-                                // so consecutive wheel ticks never interrupt UIScrollView deceleration.
+                                // Coalesce all queued mouse wheel notches into a single 5-step flick gesture
+                                // (TouchDown -> 36px Began -> Changed 1/3 -> Changed 2/3 -> Changed 3/3 -> TouchUp).
                                 while let Ok(next_c) = input_rx.try_recv() {
                                     match next_c {
                                         BridgeInputCmd::ScrollWheel { delta: d2 } => {
@@ -333,18 +449,21 @@ impl SweetBridgeService {
                                     }
                                 }
                                 let notches = (delta.abs() / 120).clamp(1, 5);
-                                let span = 260 + notches * 120;
-                                let (y0, y1) = if delta < 0 {
-                                    (1580, (1580 - span).max(420))
+                                let span = 300 + notches * 130;
+                                let (y0, dir) = if delta < 0 {
+                                    (1660, -1)
                                 } else {
-                                    (920, (920 + span).min(2060))
+                                    (840, 1)
                                 };
-                                let ym = (y0 + y1) / 2;
-                                for py in [y0, ym, y1] {
+                                let yb = (y0 + dir * 36).clamp(320, 2120);
+                                let y1 = (yb + (dir * span) / 3).clamp(320, 2120);
+                                let y2 = (yb + (dir * span * 2) / 3).clamp(320, 2120);
+                                let y3 = (yb + dir * span).clamp(320, 2120);
+                                for py in [y0, yb, y1, y2, y3] {
                                     dispatch_raw_input(1, 0, true, 540, py, Some(&metrics_in));
-                                    thread::sleep(Duration::from_millis(10));
+                                    thread::sleep(Duration::from_millis(15));
                                 }
-                                dispatch_raw_input(1, 0, false, 540, y1, Some(&metrics_in));
+                                dispatch_raw_input(1, 0, false, 540, y3, Some(&metrics_in));
                             }
                             BridgeInputCmd::KeyPress { key_id, hold_ms } => {
                                 dispatch_raw_input(2, key_id, true, 0, 0, Some(&metrics_in));

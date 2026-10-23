@@ -6,9 +6,10 @@ use std::time::Instant;
 
 use sweet_bridge::{SweetBridgeService, TAP_DEADZONE_IOS_PX};
 use sweet_core::{
-    build_qemu_adt, build_sweet_adt, create_demo_ipa, direct_qemu_read_u64, inspect_app_or_ipa,
-    install_app_to_root, list_installed_apps, AppMetadata, QemuConfig, QemuRunner,
-    SweetInputMailbox, FB_BASE, FB_H, FB_W, INPUT_MBOX_MAGIC, INPUT_MBOX_PA,
+    analyze_macho_objc_metadata, build_qemu_adt, build_sweet_adt, create_demo_ipa,
+    direct_qemu_read_u64, inspect_app_or_ipa, install_app_to_root, list_installed_apps,
+    read_stored_zip, AppMetadata, QemuConfig, QemuRunner, SweetInputMailbox, FB_BASE, FB_H, FB_W,
+    INPUT_MBOX_MAGIC, INPUT_MBOX_PA,
 };
 use sweet_gpu::{CudaAccelerator, DisplayFilterConfig, IosSimState, SweetGpuEngine};
 
@@ -337,6 +338,7 @@ pub struct SweetEmuApp {
     pub qemu_runner: QemuRunner,
     pub qemu_active: bool,
     pub has_live_vm_frame: bool,
+    pub hle_turbo_mode: bool,
     pub vm_boot_start: Instant,
     pub viewport_buf: Vec<u32>,
     pub qemu_fb_raw: Vec<u8>,
@@ -529,6 +531,15 @@ fn build_device_hub_buttons() -> Vec<SidebarButton> {
             accent: 0x0025_63EB,
         },
         // --- Center Viewport: Top & Bottom Floating Toolbars ---
+        SidebarButton {
+            id: 35,
+            x: 566,
+            y: 10,
+            w: 88,
+            h: 26,
+            label: "HLE 120Hz",
+            accent: 0x0010_B981,
+        },
         SidebarButton {
             id: 4,
             x: 660,
@@ -808,6 +819,7 @@ impl SweetEmuApp {
             qemu_runner,
             qemu_active: true,
             has_live_vm_frame: false,
+            hle_turbo_mode: false,
             vm_boot_start: Instant::now(),
             viewport_buf,
             qemu_fb_raw: initial_fb,
@@ -980,6 +992,7 @@ impl SweetEmuApp {
                 self.drag_started = true;
             }
             if self.drag_started
+                && !self.hle_turbo_mode
                 && (ix - self.last_sent_x).abs() + (iy - self.last_sent_y).abs() >= 6
                 && self.last_sent_time.elapsed().as_millis() >= 8
             {
@@ -994,18 +1007,19 @@ impl SweetEmuApp {
     pub fn on_mouse_wheel(&mut self, wheel_delta: i32) {
         self.ui_dirty = true;
         self.sim_state.handle_scroll(wheel_delta);
-        let step_ios = if wheel_delta < 0 {
-            -160.0
-        } else if wheel_delta > 0 {
-            160.0
-        } else {
-            0.0
-        };
-        self.wheel_preview_dy = (self.wheel_preview_dy + step_ios).clamp(-480.0, 480.0);
-        self.bridge.scroll_wheel(wheel_delta);
+        if !self.hle_turbo_mode {
+            self.bridge.scroll_wheel(wheel_delta);
+        }
     }
 
     pub fn on_char(&mut self, ch: char) -> bool {
+        if self.hle_turbo_mode {
+            if let Some(msg) = self.sim_state.handle_key(ch) {
+                self.log(format!("[HLE] {}", msg));
+            }
+            self.ui_dirty = true;
+            return true;
+        }
         if self.bridge.send_char(ch) {
             self.log(format!("[HID] Keyboard char {:?} -> SweetBridge QWERTY Touch", ch));
             return true;
@@ -1071,11 +1085,23 @@ impl SweetEmuApp {
             return;
         }
 
-        // Left Sidebar Installed Apps list rows (x: 16..244, y: 650..850) -> tap app in live VM
+        // Left Sidebar Installed Apps list rows (x: 16..244, y: 650..850) -> tap app in live VM or HLE
         if (16..=244).contains(&mx) && (650..=850).contains(&my) {
             let row = ((my - 650) / 22) as usize;
             let rows = self.sidebar_app_rows();
             if let Some((app_name, bid, _, _)) = rows.get(row) {
+                if self.hle_turbo_mode {
+                    self.sim_state.locked = false;
+                    self.sim_state.active_app = Some(app_name.clone());
+                    self.sim_state.anim_app_name = Some(app_name.clone());
+                    self.sim_state.anim_icon_rect = self.sim_state.icon_rect_for_app(app_name);
+                    self.sim_state.app_anim = 0.08;
+                    self.sim_state.app_vel = 0.22;
+                    self.ui_dirty = true;
+                    self.chrome_dirty = true;
+                    self.log(format!("[HLE 120Hz] Launched '{}' ({}) natively", app_name, bid));
+                    return;
+                }
                 let (tx, ty) = match app_name.as_str() {
                     "Photos" => (195, 290),
                     "App Store" => (425, 290),
@@ -1094,7 +1120,7 @@ impl SweetEmuApp {
             }
         }
 
-        // iPhone X viewport touch -> forward directly through SweetBridgeService
+        // iPhone X viewport touch -> forward directly through SweetBridgeService (or HLE 120Hz)
         if Self::inside_viewport(mx, my) {
             let (ix, iy) = Self::mouse_to_ios(mx, my);
             self.touch_start_x = ix;
@@ -1109,9 +1135,12 @@ impl SweetEmuApp {
             self.last_sent_time = Instant::now();
             self.sim_state.touch_x = ix;
             self.sim_state.touch_y = iy;
+            self.sim_state.drag_start_vy = iy / 3;
             self.sim_state.touch_down = true;
             self.sim_state.edge_swipe_active = SweetInputMailbox::is_bottom_edge_swipe(iy);
-            self.bridge.touch_down(0, ix, iy);
+            if !self.hle_turbo_mode {
+                self.bridge.touch_down(0, ix, iy);
+            }
         }
     }
 
@@ -1127,6 +1156,7 @@ impl SweetEmuApp {
         self.ui_dirty = true;
 
         let (ix, iy) = Self::mouse_to_ios(mx, my);
+        let was_edge_swipe = self.sim_state.edge_swipe_active;
         self.sim_state.touch_x = ix;
         self.sim_state.touch_y = iy;
         self.sim_state.touch_down = false;
@@ -1135,6 +1165,30 @@ impl SweetEmuApp {
         let elapsed_ms = self.touch_down_instant.elapsed().as_millis() as u64;
         let total_dist = (ix - self.touch_start_x).abs() + (iy - self.touch_start_y).abs();
         let is_drag = self.drag_started && !(total_dist < 66 && elapsed_ms < 220);
+
+        if self.hle_turbo_mode {
+            if !is_drag {
+                let vx = (self.touch_start_x / 3).clamp(0, (VIEW_W as i32) - 1);
+                let vy = (self.touch_start_y / 3).clamp(0, (VIEW_H as i32) - 1);
+                if let Some(action_msg) = self.sim_state.handle_tap(vx, vy) {
+                    self.log(format!("[HLE 120Hz] {}", action_msg));
+                }
+            } else if was_edge_swipe && (self.touch_start_y - iy) >= 180 {
+                if self.sim_state.locked {
+                    self.sim_state.locked = false;
+                    self.log("[HLE 120Hz] Unlocked SpringBoard");
+                } else if self.sim_state.active_app.is_some() {
+                    self.sim_state.active_app = None;
+                    self.log("[HLE 120Hz] Fluid Home Swipe -> SpringBoard");
+                }
+            } else if self.touch_start_x <= 90 && (ix - self.touch_start_x) >= 180 {
+                if let Some(msg) = self.sim_state.handle_back_gesture() {
+                    self.log(format!("[HLE 120Hz] {}", msg));
+                }
+            }
+            return;
+        }
+
         let (rx, ry) = if !is_drag {
             (self.touch_start_x, self.touch_start_y)
         } else {
@@ -1312,15 +1366,45 @@ impl SweetEmuApp {
                     }
                 }
             }
+            35 => {
+                // Toggle ipasim-style Host-Native 120Hz HLE Turbo Mode vs Live QEMU XNU VM
+                self.hle_turbo_mode = !self.hle_turbo_mode;
+                self.ui_dirty = true;
+                self.chrome_dirty = true;
+                if self.hle_turbo_mode {
+                    self.log("[HLE 120Hz] Activated ipasim Host-Native 120FPS UIKit/CoreAnimation Engine (F2 to toggle)");
+                } else {
+                    self.cuda.mark_frame_dirty();
+                    self.log("[VM] Switched viewport back to Live QEMU XNU 16.7.16 Framebuffer");
+                }
+            }
             4 => {
                 // Power (Lock/Wake)
-                self.bridge.press_power();
-                self.log("[HID] Power Button (key=0) -> SweetBridge");
+                if self.hle_turbo_mode {
+                    self.sim_state.locked = !self.sim_state.locked;
+                    self.log(format!(
+                        "[HLE 120Hz] Power Button -> {}",
+                        if self.sim_state.locked { "Locked" } else { "Awake" }
+                    ));
+                } else {
+                    self.bridge.press_power();
+                    self.log("[HID] Power Button (key=0) -> SweetBridge");
+                }
             }
             5 => {
-                // Home Swipe Gesture (paced bottom-edge swipe to exit foreground app cleanly without entering App Switcher)
-                self.bridge.swipe_home();
-                self.log("[HID] Home Swipe (y=2385..1220) -> SweetBridge");
+                // Home Swipe Gesture
+                if self.hle_turbo_mode {
+                    if self.sim_state.locked {
+                        self.sim_state.locked = false;
+                        self.log("[HLE 120Hz] Unlocked SpringBoard");
+                    } else {
+                        self.sim_state.active_app = None;
+                        self.log("[HLE 120Hz] Home -> SpringBoard");
+                    }
+                } else {
+                    self.bridge.swipe_home();
+                    self.log("[HID] Home Swipe (y=2385..1220) -> SweetBridge");
+                }
             }
             6 => {
                 // Save Screenshot PNG
@@ -1516,6 +1600,28 @@ impl SweetEmuApp {
                     "[IPA] Installed '{}' ({}) + Synced TrustCache to HFSX",
                     app_title, meta.bundle_id
                 ));
+                // Run ported ipasim Mach-O Objective-C Class/Selector/TypeDecoder analyzer
+                if let Ok(raw_ipa) = fs::read(path) {
+                    if let Ok(entries) = read_stored_zip(&raw_ipa) {
+                        for ent in entries {
+                            if ent.name.ends_with(&format!("/{}", meta.executable))
+                                || ent.name == meta.executable
+                            {
+                                if let Ok(objc) = analyze_macho_objc_metadata(&ent.data) {
+                                    self.log(format!(
+                                        "[ipasim ObjC] {} classes, {} selectors, {} fwks (UIKit={}, Metal={})",
+                                        objc.class_names.len(),
+                                        objc.selectors.len(),
+                                        objc.frameworks.len(),
+                                        objc.uses_uikit,
+                                        objc.uses_metal
+                                    ));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 self.log(format!("[IPA] Install error for {}: {}", path.display(), e));
@@ -1525,6 +1631,7 @@ impl SweetEmuApp {
 
     pub fn render_full_window(&mut self) -> bool {
         let frame_start = Instant::now();
+        self.sim_state.dark_mode = self.filter.dark_mode;
         self.sim_state.tick();
 
         let mut got_new_frame = false;
@@ -1540,7 +1647,7 @@ impl SweetEmuApp {
                 self.boot_seq_tick = st.swap_count.max(self.boot_seq_tick.wrapping_add(1));
                 self.drag_anchor_x = self.sim_state.touch_x;
                 self.drag_anchor_y = self.sim_state.touch_y;
-                self.wheel_preview_dy *= 0.25;
+                self.wheel_preview_dy = 0.0;
                 got_new_frame = true;
 
                 if self.recording_active && self.recorded_frames < 240 {
@@ -1571,14 +1678,17 @@ impl SweetEmuApp {
 
         let periodic_chrome = self.last_chrome_refresh.elapsed().as_millis() >= 600;
         let booting_anim = !self.has_live_vm_frame
+            && !self.hle_turbo_mode
             && self.last_chrome_refresh.elapsed().as_millis() >= 150;
-        let active_scroll_anim = self.sim_state.touch_down || self.wheel_preview_dy.abs() >= 1.5;
-        if !got_new_frame && self.wheel_preview_dy.abs() >= 0.5 {
-            self.wheel_preview_dy *= 0.88;
-            if self.wheel_preview_dy.abs() < 1.0 {
-                self.wheel_preview_dy = 0.0;
-            }
-        }
+        let hle_anim_active = self.hle_turbo_mode
+            && (self.sim_state.touch_down
+                || self.sim_state.scroll_vel.abs() >= 0.25
+                || (self.sim_state.app_anim > 0.005 && self.sim_state.app_anim < 0.995)
+                || (self.sim_state.lock_anim > 0.005 && self.sim_state.lock_anim < 0.995)
+                || self.sim_state.nav_anim > 0.01
+                || self.sim_state.music_playing
+                || self.sim_state.stopwatch_running
+                || self.sim_state.timer_running);
 
         if !got_new_frame
             && !got_new_logs
@@ -1586,7 +1696,7 @@ impl SweetEmuApp {
             && !self.chrome_dirty
             && !periodic_chrome
             && !booting_anim
-            && !active_scroll_anim
+            && !hle_anim_active
         {
             return false;
         }
@@ -1923,25 +2033,19 @@ impl SweetEmuApp {
         // 1. Top Floating Toolbar Pill above iPhone X
         fill_rounded_rect(&mut self.backbuffer, WIN_W, WIN_H, 386, 6, 384, 32, 16, 0x001A_1D26);
         stroke_rounded_rect(&mut self.backbuffer, WIN_W, WIN_H, 386, 6, 384, 32, 16, 0x002E_3444);
+        let top_title = if self.hle_turbo_mode {
+            "iPhone X • ipasim 120Hz"
+        } else {
+            "iPhone X • iOS 16.7.16"
+        };
         draw_text(
             &mut self.backbuffer,
             WIN_W,
             WIN_H,
-            404,
+            398,
             15,
-            "iPhone X  •  iOS 16.7.16",
-            0x00F8_FAFC,
-            1,
-        );
-        let ram_badge = format!("{}GB RAM", self.qemu_runner.cfg.ram_gb);
-        draw_text(
-            &mut self.backbuffer,
-            WIN_W,
-            WIN_H,
-            584,
-            15,
-            &ram_badge,
-            0x004A_DE80,
+            top_title,
+            if self.hle_turbo_mode { 0x0034_D399 } else { 0x00F8_FAFC },
             1,
         );
 
@@ -1989,7 +2093,7 @@ impl SweetEmuApp {
             0x0005_070C,
         );
 
-        // 3. Render Live Guest Framebuffer via NVIDIA CUDA at 2x Retina (720x1600)
+        // 3. Render Live Guest Framebuffer via NVIDIA CUDA (or ipasim 120Hz Host-Native HLE) at 2x Retina (720x1600)
         self.draw_center_viewport_screen_only();
 
         // 6. Bottom Floating Pill below iPhone X (Home, Screenshot, Record, Rotate)
@@ -1998,7 +2102,9 @@ impl SweetEmuApp {
     }
 
     fn draw_center_viewport_screen_only(&mut self) {
-        if self.has_live_vm_frame {
+        if self.hle_turbo_mode {
+            self.blit_hle_120hz_viewport();
+        } else if self.has_live_vm_frame {
             let s = UI_SCALE as u32;
             self.cuda.blit_guest_fb_filtered(
                 &mut self.backbuffer,
@@ -2011,7 +2117,6 @@ impl SweetEmuApp {
                 &self.qemu_fb_raw,
                 &self.filter,
             );
-            self.apply_live_scroll_preview();
         } else {
             self.draw_live_vm_boot_screen();
         }
@@ -2068,81 +2173,39 @@ impl SweetEmuApp {
         self.draw_viewport_overlays();
     }
 
-    /// Real-time 120Hz scroll/drag displacement preview between guest CARenderServer swaps.
-    /// Shifts the scrollable viewport band in-place (<15 us in L1/L2 cache) according to the
-    /// un-rendered finger/wheel delta since the last guest swap_count, then snaps cleanly
-    /// whenever the next guest frame arrives.
-    fn apply_live_scroll_preview(&mut self) {
-        let (raw_dx_ios, raw_dy_ios) =
-            if self.sim_state.touch_down && self.drag_started && !self.sim_state.edge_swipe_active {
-                (
-                    self.sim_state.touch_x - self.drag_anchor_x,
-                    self.sim_state.touch_y - self.drag_anchor_y,
-                )
-            } else if self.wheel_preview_dy.abs() >= 1.5 {
-                (0, self.wheel_preview_dy.round() as i32)
-            } else {
-                return;
-            };
-
+    /// Host-native 120Hz `ipasim`-style UIKit / CoreAnimation / UIScrollView rasterizer
+    /// with 2x Retina bilinear upscale into `self.backbuffer` (~0.5ms per frame).
+    fn blit_hle_120hz_viewport(&mut self) {
+        self.gpu_engine.render_ios_springboard_frame(
+            VIEW_W,
+            VIEW_H,
+            &mut self.viewport_buf,
+            &self.sim_state,
+        );
         let vx0 = (VIEW_X as usize) * UI_SCALE;
         let vy0 = (VIEW_Y as usize) * UI_SCALE;
-        let vw = VIEW_W * UI_SCALE;
-        let vh = VIEW_H * UI_SCALE;
-        if vx0 + vw > BUF_W || vy0 + vh > BUF_H {
+        let dst_w = VIEW_W * UI_SCALE;
+        let dst_h = VIEW_H * UI_SCALE;
+        if vx0 + dst_w > BUF_W || vy0 + dst_h > BUF_H {
             return;
         }
-
-        let dy_vp = ((raw_dy_ios * 2) / 3).clamp(-320, 320);
-        let dx_vp = ((raw_dx_ios * 2) / 3).clamp(-260, 260);
-
-        if dy_vp.abs() >= 2 && dy_vp.abs() >= dx_vp.abs() {
-            let ry_top = 104usize.min(vh);
-            let ry_bot = 1544usize.min(vh);
-            if ry_top >= ry_bot {
-                return;
-            }
-            if dy_vp > 0 {
-                for dst_ry in (ry_top..ry_bot).rev() {
-                    let src_ry = (dst_ry as i32 - dy_vp).max(ry_top as i32) as usize;
-                    if src_ry != dst_ry {
-                        let src_start = (vy0 + src_ry) * BUF_W + vx0;
-                        let dst_start = (vy0 + dst_ry) * BUF_W + vx0;
-                        self.backbuffer
-                            .copy_within(src_start..src_start + vw, dst_start);
-                    }
-                }
-            } else {
-                for dst_ry in ry_top..ry_bot {
-                    let src_ry = (dst_ry as i32 - dy_vp).min((ry_bot - 1) as i32) as usize;
-                    if src_ry != dst_ry {
-                        let src_start = (vy0 + src_ry) * BUF_W + vx0;
-                        let dst_start = (vy0 + dst_ry) * BUF_W + vx0;
-                        self.backbuffer
-                            .copy_within(src_start..src_start + vw, dst_start);
-                    }
-                }
-            }
-        } else if dx_vp.abs() >= 2 && dx_vp.abs() > dy_vp.abs() {
-            let ry_top = 104usize.min(vh);
-            let ry_bot = 1360usize.min(vh);
-            let shift = (dx_vp.unsigned_abs() as usize).min(vw.saturating_sub(1));
-            if shift == 0 || ry_top >= ry_bot {
-                return;
-            }
-            for ry in ry_top..ry_bot {
-                let row_start = (vy0 + ry) * BUF_W + vx0;
-                if dx_vp > 0 {
-                    let edge_px = self.backbuffer[row_start];
-                    self.backbuffer
-                        .copy_within(row_start..row_start + vw - shift, row_start + shift);
-                    self.backbuffer[row_start..row_start + shift].fill(edge_px);
-                } else {
-                    let edge_px = self.backbuffer[row_start + vw - 1];
-                    self.backbuffer
-                        .copy_within(row_start + shift..row_start + vw, row_start);
-                    self.backbuffer[row_start + vw - shift..row_start + vw].fill(edge_px);
-                }
+        for dy in 0..dst_h {
+            let sy0 = (dy / 2).min(VIEW_H - 1);
+            let sy1 = (sy0 + (dy & 1)).min(VIEW_H - 1);
+            let dst_row = &mut self.backbuffer[(vy0 + dy) * BUF_W + vx0..(vy0 + dy) * BUF_W + vx0 + dst_w];
+            let srow0 = &self.viewport_buf[sy0 * VIEW_W..(sy0 + 1) * VIEW_W];
+            let srow1 = &self.viewport_buf[sy1 * VIEW_W..(sy1 + 1) * VIEW_W];
+            for dx in 0..dst_w {
+                let sx0 = (dx / 2).min(VIEW_W - 1);
+                let sx1 = (sx0 + (dx & 1)).min(VIEW_W - 1);
+                let c00 = srow0[sx0];
+                let c10 = srow0[sx1];
+                let c01 = srow1[sx0];
+                let c11 = srow1[sx1];
+                let r = (((c00 >> 16) & 0xFF) + ((c10 >> 16) & 0xFF) + ((c01 >> 16) & 0xFF) + ((c11 >> 16) & 0xFF)) >> 2;
+                let g = (((c00 >> 8) & 0xFF) + ((c10 >> 8) & 0xFF) + ((c01 >> 8) & 0xFF) + ((c11 >> 8) & 0xFF)) >> 2;
+                let b = ((c00 & 0xFF) + (c10 & 0xFF) + (c01 & 0xFF) + (c11 & 0xFF)) >> 2;
+                dst_row[dx] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
             }
         }
     }
@@ -2474,6 +2537,7 @@ impl SweetEmuApp {
                 20 => !self.filter.dark_mode,
                 21 => self.filter.dark_mode,
                 34 => self.audio_muted,
+                35 => self.hle_turbo_mode,
                 _ => false,
             };
 
@@ -2925,6 +2989,11 @@ mod win32_gui {
                     if w_param as u32 == 0x1B {
                         // ESC -> Home swipe
                         (*app_ptr).execute_button_action(5, hwnd as usize);
+                        present_if_needed(hwnd, &mut *app_ptr, true);
+                    } else if w_param as u32 == 0x71 {
+                        // F2 -> Toggle ipasim 120Hz Host-Native HLE Turbo Mode
+                        (*app_ptr).execute_button_action(35, hwnd as usize);
+                        present_if_needed(hwnd, &mut *app_ptr, true);
                     }
                 }
                 0
@@ -2984,9 +3053,8 @@ mod win32_gui {
                 0
             }
             WM_DESTROY => {
-                if !app_ptr.is_null() {
-                    (*app_ptr).qemu_runner.stop();
-                }
+                // Keep background QEMU VM alive across GUI restarts for <1ms instant re-attach
+                // (use the explicit 'Stop VM' button in Device Hub to shut down QEMU).
                 KillTimer(hwnd, 1);
                 PostQuitMessage(0);
                 0

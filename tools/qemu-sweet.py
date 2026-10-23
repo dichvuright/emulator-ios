@@ -636,7 +636,7 @@ class QemuProcessRamReader:
                 cy,
             )
             pending = (w_idx - r_idx) & 0xffffffff
-            if int(ev_type) == 1 and down and 1 <= pending < INPUT_MBOX_RING_SIZE:
+            if int(ev_type) == 1 and down and 8 <= pending < INPUT_MBOX_RING_SIZE:
                 prev_slot = (w_idx - 1) % INPUT_MBOX_RING_SIZE
                 prev_off = INPUT_MBOX_HEADER_SIZE + prev_slot * INPUT_MBOX_ENTRY_SIZE
                 prev_raw = self.read_pa(INPUT_MBOX_PA + prev_off, 8)
@@ -912,7 +912,17 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
+    ap.add_argument('--sync-only', action='store_true', help='synchronize HFSX plists/prefs into --disk without launching QEMU')
     a = ap.parse_args()
+
+    if a.sync_only:
+        disk_target = a.disk or os.path.join('emu_workspace', 'ios16-root-20H392.img')
+        if not os.path.isfile(disk_target):
+            print(f'[!] Error: disk image not found: {disk_target}', file=sys.stderr)
+            return 1
+        sync_hfsx_image(disk_target)
+        print(f'[+] HFSX image synced: {disk_target}')
+        return 0
 
     if a.check_env:
         ok = check_qemu_dependency(a.cpu)
@@ -1759,6 +1769,19 @@ def sync_hfsx_image(disk_path):
                                                 'com.apple.AppSSODaemon.plist',
                                                 'com.apple.GSSCred.plist',
                                                 'com.apple.VideoSubscriberAccount.',
+                                                'com.apple.videosubscriptionsd.plist',
+                                                'com.apple.FileProvider.plist',
+                                                'com.apple.filesystems.livefileproviderd.plist',
+                                                'com.apple.ManagedSettingsAgent.plist',
+                                                'com.apple.privacyaccountingd.plist',
+                                                'com.apple.nfcd.plist',
+                                                'com.apple.rapportd.plist',
+                                                'com.apple.CommCenter',
+                                                'com.apple.AccessibilityUIServer.plist',
+                                                'com.apple.accessibility.axassetsd.plist',
+                                                'com.apple.accessibility.axremoted.plist',
+                                                'com.apple.accessibility.heard.plist',
+                                                'com.apple.accessibility.motiontrackingd.plist',
                                                 'com.apple.SiriTTSService.',
                                                 'com.apple.siri.',
                                                 '/System/Library/NanoLaunchDaemons/',
@@ -1777,10 +1800,13 @@ def sync_hfsx_image(disk_path):
                                                 'com.apple.liveactivitiesd.plist',
                                                 'com.apple.triald.plist',
                                                 'com.apple.biomed.plist',
+                                                'com.apple.biomesyncd.plist',
                                                 'com.apple.duetexpertd.plist',
                                                 'com.apple.suggestd.plist',
                                                 'com.apple.parsecd.plist',
                                                 'com.apple.searchd.plist',
+                                                'com.apple.searchpartyd.plist',
+                                                'com.apple.findmydeviced',
                                                 'com.apple.cloudd.plist',
                                                 'com.apple.bird.plist',
                                                 'com.apple.analyticsd.plist',
@@ -1788,6 +1814,8 @@ def sync_hfsx_image(disk_path):
                                                 'com.apple.powerlogHelperd.plist',
                                                 'com.apple.PerfPowerServicesExtended.plist',
                                                 'com.apple.CAReportingService.plist',
+                                                'com.apple.corespotlightd.plist',
+                                                'com.apple.appstored.plist',
                                                 'com.apple.itunesstored.plist',
                                                 'com.apple.bookassetd.plist',
                                                 'com.apple.amsengagementd.plist',
@@ -1800,18 +1828,46 @@ def sync_hfsx_image(disk_path):
                                                 'com.apple.FaceTime.',
                                                 'com.apple.apsd.plist',
                                                 'com.apple.ScreenTimeAgent.plist',
+                                                'com.apple.ManagedSettingsAgent.plist',
+                                                'com.apple.privacyaccountingd.plist',
                                                 'com.apple.familycircled.plist',
                                                 'com.apple.CircleJoinRequested.plist',
                                                 'com.apple.cdpd.plist',
                                                 'com.apple.pfd.plist',
+                                                'com.apple.ind.plist',
+                                                'com.apple.akd.plist',
+                                                'com.apple.appleaccountd.plist',
                                                 'com.apple.coreidvd.plist',
+                                                'com.apple.dmd.plist',
+                                                'com.apple.passd.plist',
+                                                'com.apple.nfcd.plist',
+                                                'com.apple.seld.plist',
+                                                'com.apple.seserviced.plist',
+                                                'com.apple.rapportd.plist',
+                                                'com.apple.CommCenter',
+                                                'com.apple.FileProvider.plist',
+                                                'com.apple.filesystems.livefileproviderd.plist',
+                                                'com.apple.VideoSubscriberAccount.',
+                                                'com.apple.videosubscriptionsd.plist',
+                                                'com.apple.AppSSODaemon.plist',
+                                                'com.apple.GSSCred.plist',
+                                                'com.apple.AccessibilityUIServer.plist',
+                                                'com.apple.accessibility.axassetsd.plist',
+                                                'com.apple.accessibility.axremoted.plist',
+                                                'com.apple.accessibility.heard.plist',
+                                                'com.apple.accessibility.motiontrackingd.plist',
                                                 'com.apple.voiced.plist',
+                                                'com.apple.contextstored.plist',
                                                 'com.apple.transparencyd.plist',
                                                 'com.apple.sociallayerd.plist',
+                                                'com.apple.useractivityd.plist',
+                                                'com.apple.syncdefaultsd.plist',
+                                                'com.apple.webbookmarksd.plist',
                                                 'com.apple.SafariBookmarksSyncAgent.plist',
                                                 'com.apple.ndoagent.plist',
                                                 'com.apple.mobilerepaird.plist',
                                                 'com.apple.announced.plist',
+                                                'com.apple.donotdisturbd.plist',
                                                 'com.apple.SiriTTSService.',
                                                 'com.apple.siri.',
                                                 '/System/Library/NanoLaunchDaemons/',
@@ -1819,15 +1875,16 @@ def sync_hfsx_image(disk_path):
                                             for dk, dv in daemons.items():
                                                 if not isinstance(dv, dict):
                                                     continue
-                                                if 'com.apple.gamecontrollerd.plist' in dk:
+                                                if 'gamecontrollerd.plist' in dk.lower():
                                                     if not dv.get('RunAtLoad'):
                                                         dv['RunAtLoad'] = True
                                                         changed = True
                                                     continue
                                                 if any(tok in dk for tok in bg_throttle_tokens):
-                                                    if 'KeepAlive' in dv:
-                                                        dv.pop('KeepAlive', None)
-                                                        changed = True
+                                                    for k_strip in ('KeepAlive', 'LaunchEvents', 'Events', 'StartInterval', 'StartCalendarInterval'):
+                                                        if k_strip in dv:
+                                                            dv.pop(k_strip, None)
+                                                            changed = True
                                                     if dv.get('RunAtLoad'):
                                                         dv['RunAtLoad'] = False
                                                         changed = True
@@ -1835,12 +1892,10 @@ def sync_hfsx_image(disk_path):
                                                         dv['ThrottleInterval'] = 3600
                                                         changed = True
                                                 if any(tok in dk for tok in no_ipc_bloat_tokens):
-                                                    if 'MachServices' in dv:
-                                                        dv.pop('MachServices', None)
-                                                        changed = True
-                                                    if 'Events' in dv:
-                                                        dv.pop('Events', None)
-                                                        changed = True
+                                                    for k_strip in ('MachServices', 'LaunchEvents', 'Events', 'KeepAlive', 'StartInterval', 'StartCalendarInterval'):
+                                                        if k_strip in dv:
+                                                            dv.pop(k_strip, None)
+                                                            changed = True
                                     elif name == '.com.apple.mobile_container_manager.metadata.plist':
                                         if not isinstance(pl.get('MCMMetadataInfo'), dict):
                                             pl['MCMMetadataInfo'] = {}

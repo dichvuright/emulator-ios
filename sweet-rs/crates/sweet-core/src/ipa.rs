@@ -1670,17 +1670,332 @@ pub fn install_app_to_root(path: &Path, root_dir: &Path) -> Result<AppMetadata, 
         let _ = fs::write(ws_dir.join("sweet_trustcache.bin"), &tc_blob);
         let hfsx_img = ws_dir.join("ios16-root-20H392.img");
         if hfsx_img.is_file() {
-            let py_code = format!(
-                "import sys; sys.path.insert(0, 'tools'); import qemu_sweet; qemu_sweet.sync_hfsx_image(r'{}')",
-                hfsx_img.display()
-            );
             let _ = Command::new("python")
-                .args(["-c", &py_code])
+                .args([
+                    "tools/qemu-sweet.py",
+                    "--sync-only",
+                    "--disk",
+                    &hfsx_img.to_string_lossy(),
+                ])
                 .output();
         }
     }
 
     Ok(meta)
+}
+
+// ---------------------------------------------------------------------------
+// ipasim-Ported Mach-O Objective-C Class / Selector / TypeDecoder HLE Analyzer
+// (Ported from ipasim/src/IpaSimulator/SysTranslator.cpp & MachO.cpp)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpasimObjcMethod {
+    pub selector: String,
+    pub raw_type_encoding: String,
+    pub decoded_signature: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpasimMachOAnalysis {
+    pub class_names: Vec<String>,
+    pub selectors: Vec<String>,
+    pub methods: Vec<IpasimObjcMethod>,
+    pub frameworks: Vec<String>,
+    pub uses_uikit: bool,
+    pub uses_metal: bool,
+    pub uses_quartzcore: bool,
+}
+
+/// Port of `ipasim`'s `TypeDecoder` (`SysTranslator.cpp`): decodes an Objective-C method
+/// or ivar type encoding string (e.g. `v24@0:8@16`, `@16@0:8`, `{CGRect={CGPoint=dd}{CGSize=dd}}`)
+/// into human-readable & HLE-dispatchable parameter types.
+pub fn decode_objc_type_encoding(enc: &str) -> Vec<String> {
+    fn parse_one(bytes: &[u8], i: &mut usize) -> Option<String> {
+        while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i >= bytes.len() {
+            return None;
+        }
+        // Strip qualifiers: r(const), n(in), N(inout), o(out), O(bycopy), R(byref), V(oneway)
+        while *i < bytes.len() && matches!(bytes[*i], b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V') {
+            *i += 1;
+        }
+        if *i >= bytes.len() {
+            return None;
+        }
+        let b = bytes[*i];
+        *i += 1;
+        let ty = match b {
+            b'v' => "void".to_string(),
+            b'@' => {
+                if *i < bytes.len() && bytes[*i] == b'?' {
+                    *i += 1;
+                    "Block".to_string()
+                } else if *i < bytes.len() && bytes[*i] == b'"' {
+                    *i += 1;
+                    let start = *i;
+                    while *i < bytes.len() && bytes[*i] != b'"' {
+                        *i += 1;
+                    }
+                    let cls = String::from_utf8_lossy(&bytes[start..*i]).into_owned();
+                    if *i < bytes.len() {
+                        *i += 1;
+                    }
+                    format!("{}*", cls)
+                } else {
+                    "id".to_string()
+                }
+            }
+            b'#' => "Class".to_string(),
+            b':' => "SEL".to_string(),
+            b'c' => "char".to_string(),
+            b'C' => "uint8".to_string(),
+            b's' => "int16".to_string(),
+            b'S' => "uint16".to_string(),
+            b'i' => "int32".to_string(),
+            b'I' => "uint32".to_string(),
+            b'l' => "long".to_string(),
+            b'L' => "ulong".to_string(),
+            b'q' => "int64".to_string(),
+            b'Q' => "uint64".to_string(),
+            b'f' => "float".to_string(),
+            b'd' => "CGFloat".to_string(),
+            b'B' => "BOOL".to_string(),
+            b'*' => "char*".to_string(),
+            b'^' => {
+                let inner = parse_one(bytes, i).unwrap_or_else(|| "void".to_string());
+                format!("{}*", inner)
+            }
+            b'{' => {
+                let start = *i;
+                let mut depth = 1usize;
+                let mut eq_pos = None;
+                while *i < bytes.len() && depth > 0 {
+                    match bytes[*i] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        b'=' if depth == 1 && eq_pos.is_none() => eq_pos = Some(*i),
+                        _ => {}
+                    }
+                    *i += 1;
+                }
+                let end = eq_pos.unwrap_or_else(|| (*i).saturating_sub(1));
+                let name = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+                if name.is_empty() || name == "?" {
+                    "struct".to_string()
+                } else {
+                    name
+                }
+            }
+            b'[' => {
+                let mut depth = 1usize;
+                while *i < bytes.len() && depth > 0 {
+                    match bytes[*i] {
+                        b'[' => depth += 1,
+                        b']' => depth -= 1,
+                        _ => {}
+                    }
+                    *i += 1;
+                }
+                "array".to_string()
+            }
+            _ => "unknown".to_string(),
+        };
+        while *i < bytes.len() && (bytes[*i].is_ascii_digit() || bytes[*i] == b'-' || bytes[*i] == b'+') {
+            *i += 1;
+        }
+        Some(ty)
+    }
+
+    let bytes = enc.as_bytes();
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        if let Some(t) = parse_one(bytes, &mut i) {
+            out.push(t);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Inspect a 64-bit ARM64 Mach-O slice (or fat binary) to extract Objective-C class names,
+/// selectors, method signatures, and linked Apple frameworks for `ipasim`-style HLE dispatch.
+pub fn analyze_macho_objc_metadata(data: &[u8]) -> Result<IpasimMachOAnalysis, String> {
+    if data.len() < 32 {
+        return Err("Mach-O buffer too small".to_string());
+    }
+    let slice = {
+        let m_be = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        if m_be == FAT_MAGIC || m_be == FAT_CIGAM {
+            let nfat = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            let mut found = None;
+            for idx in 0..nfat {
+                let off = 8 + idx * 20;
+                if off + 20 > data.len() {
+                    break;
+                }
+                let cputype = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let foff = u32::from_be_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]) as usize;
+                let fsz = u32::from_be_bytes([data[off + 12], data[off + 13], data[off + 14], data[off + 15]]) as usize;
+                if cputype == CPU_TYPE_ARM64 && foff + fsz <= data.len() {
+                    found = Some(&data[foff..foff + fsz]);
+                    break;
+                }
+            }
+            found.unwrap_or(data)
+        } else {
+            data
+        }
+    };
+
+    if slice.len() < 32 {
+        return Err("Mach-O slice too small".to_string());
+    }
+    let magic = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    if magic != MH_MAGIC_64 {
+        return Err("Not a 64-bit little-endian Mach-O".to_string());
+    }
+    let ncmds = u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]) as usize;
+    let mut analysis = IpasimMachOAnalysis::default();
+    let mut raw_meth_types = Vec::new();
+    let mut cmd_off = 32usize;
+
+    let collect_cstrings = |buf: &[u8], cap: usize| -> Vec<String> {
+        let mut res = Vec::new();
+        for part in buf.split(|&b| b == 0) {
+            if !part.is_empty() && part.iter().all(|&c| (0x20..=0x7e).contains(&c)) {
+                if let Ok(s) = std::str::from_utf8(part) {
+                    res.push(s.to_string());
+                    if res.len() >= cap {
+                        break;
+                    }
+                }
+            }
+        }
+        res
+    };
+
+    for _ in 0..ncmds {
+        if cmd_off + 8 > slice.len() {
+            break;
+        }
+        let cmd = u32::from_le_bytes([
+            slice[cmd_off],
+            slice[cmd_off + 1],
+            slice[cmd_off + 2],
+            slice[cmd_off + 3],
+        ]);
+        let cmdsize = u32::from_le_bytes([
+            slice[cmd_off + 4],
+            slice[cmd_off + 5],
+            slice[cmd_off + 6],
+            slice[cmd_off + 7],
+        ]) as usize;
+        if cmdsize < 8 || cmd_off + cmdsize > slice.len() {
+            break;
+        }
+
+        if matches!(
+            cmd,
+            LC_LOAD_DYLIB | LC_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_LAZY_LOAD_DYLIB | LC_LOAD_UPWARD_DYLIB
+        ) && cmdsize >= 24
+        {
+            let str_off = u32::from_le_bytes([
+                slice[cmd_off + 8],
+                slice[cmd_off + 9],
+                slice[cmd_off + 10],
+                slice[cmd_off + 11],
+            ]) as usize;
+            if str_off < cmdsize {
+                let tail = &slice[cmd_off + str_off..cmd_off + cmdsize];
+                let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+                let dylib = String::from_utf8_lossy(&tail[..end]).into_owned();
+                if dylib.contains("UIKit") {
+                    analysis.uses_uikit = true;
+                }
+                if dylib.contains("Metal") {
+                    analysis.uses_metal = true;
+                }
+                if dylib.contains("QuartzCore") {
+                    analysis.uses_quartzcore = true;
+                }
+                analysis.frameworks.push(dylib);
+            }
+        } else if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
+            let nsects = u32::from_le_bytes([
+                slice[cmd_off + 64],
+                slice[cmd_off + 65],
+                slice[cmd_off + 66],
+                slice[cmd_off + 67],
+            ]) as usize;
+            for s_idx in 0..nsects {
+                let soff = cmd_off + 72 + s_idx * 80;
+                if soff + 80 > cmd_off + cmdsize {
+                    break;
+                }
+                let sect_raw = &slice[soff..soff + 16];
+                let sect_end = sect_raw.iter().position(|&b| b == 0).unwrap_or(16);
+                let sect_name = std::str::from_utf8(&sect_raw[..sect_end]).unwrap_or("");
+                let size = u64::from_le_bytes([
+                    slice[soff + 40],
+                    slice[soff + 41],
+                    slice[soff + 42],
+                    slice[soff + 43],
+                    slice[soff + 44],
+                    slice[soff + 45],
+                    slice[soff + 46],
+                    slice[soff + 47],
+                ]) as usize;
+                let file_off = u32::from_le_bytes([
+                    slice[soff + 48],
+                    slice[soff + 49],
+                    slice[soff + 50],
+                    slice[soff + 51],
+                ]) as usize;
+                if file_off + size <= slice.len() {
+                    let sbuf = &slice[file_off..file_off + size];
+                    match sect_name {
+                        "__objc_classname" => {
+                            analysis.class_names.extend(collect_cstrings(sbuf, 256));
+                        }
+                        "__objc_methname" => {
+                            analysis.selectors.extend(collect_cstrings(sbuf, 512));
+                        }
+                        "__objc_methtype" => {
+                            raw_meth_types.extend(collect_cstrings(sbuf, 512));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        cmd_off += cmdsize;
+    }
+
+    for (idx, sel) in analysis.selectors.iter().take(64).enumerate() {
+        let enc = raw_meth_types
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| "v16@0:8".to_string());
+        let decoded = decode_objc_type_encoding(&enc);
+        let ret = decoded.first().cloned().unwrap_or_else(|| "void".to_string());
+        let args = if decoded.len() > 3 {
+            decoded[3..].join(", ")
+        } else {
+            String::new()
+        };
+        analysis.methods.push(IpasimObjcMethod {
+            selector: sel.clone(),
+            raw_type_encoding: enc,
+            decoded_signature: format!("{} [{}]({})", ret, sel, args),
+        });
+    }
+
+    Ok(analysis)
 }
 
 /// List all installed apps in `root_dir` from `private/var/db/sweet_installed_apps.txt`

@@ -414,11 +414,10 @@ mod win32_ram {
             ev[8..12].copy_from_slice(&x.to_le_bytes());
             ev[12..16].copy_from_slice(&y.to_le_bytes());
 
-            // In-place move coalescing: if there is already >= 1 unread event in the ring
-            // and both the new event and the tail unread event are touch-down/move (type=1, down=1),
-            // overwrite the tail slot in-place so the ring buffer never builds a lag backlog!
+            // In-place move coalescing: only coalesce when >= 8 unread events are queued
+            // so TouchDown, Began, and Changed gesture trajectory steps are NEVER overwritten!
             let pending = w_idx.wrapping_sub(r_idx);
-            if ev_type == 1 && down && pending >= 1 && pending < 64 {
+            if ev_type == 1 && down && pending >= 8 && pending < 64 {
                 let prev_slot = (w_idx.wrapping_sub(1) as usize) & 63;
                 let prev_va = mbox_va + 16 + prev_slot * 16;
                 let mut prev_ev = [0u8; 8];
@@ -847,6 +846,24 @@ pub fn qmp_execute_json(port: u16, command_json: &str, timeout_ms: u64) -> Resul
 impl QemuRunner {
     pub fn find_qemu_binary() -> Option<String> {
         find_qemu_binary_impl()
+    }
+
+    /// Re-attach in <1ms to an already-running QEMU XNU VM if Direct-RAM attachment succeeds
+    /// and the guest has already presented at least 1 frame (`SWAP_COUNT_PA = 0xa207_2020`).
+    pub fn attach_if_live(cfg: &QemuConfig) -> Option<Self> {
+        let (_pid, _base) = direct_qemu_attachment_info()?;
+        let swaps = direct_qemu_read_u64(0xa207_2020).unwrap_or(0);
+        if swaps == 0 {
+            return None;
+        }
+        let mut final_cfg = cfg.clone();
+        if final_cfg.qemu_bin.is_empty() {
+            final_cfg.qemu_bin = Self::find_qemu_binary().unwrap_or_default();
+        }
+        Some(Self {
+            cfg: final_cfg,
+            mbox: SweetInputMailbox::new(),
+        })
     }
 
     pub fn start(cfg: &QemuConfig) -> Result<Self, String> {
