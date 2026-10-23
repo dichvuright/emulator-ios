@@ -74,8 +74,8 @@ impl DisplayFilterConfig {
 }
 
 /// Embedded PTX 6.0 (`sm_50`) module containing:
-/// - `sweet_motion_kernel`: 256-thread shared-memory coherent rigid optical-flow estimator (`sad.u32`)
-/// - `sweet_fb_kernel`: 120Hz bidirectional motion-compensated & occlusion-guarded 9-tap Retina filter
+/// - `sweet_motion_kernel`: 512-thread 2-stage coarse (`±760 px`) + 1px-fine coherent rigid optical-flow estimator (`sad.u32`)
+/// - `sweet_fb_kernel`: 120Hz `i16` motion-compensated + zero-latency live-drag warped & occlusion-guarded 9-tap Retina filter
 const CUDA_PTX_MODULE: &[u8] = b"\
 .version 6.0\n\
 .target sm_50\n\
@@ -87,64 +87,84 @@ const CUDA_PTX_MODULE: &[u8] = b"\
     .param .u64 p_motion\n\
 )\n\
 {\n\
-    .shared .align 4 .b8 s_sad[1024];\n\
+    .shared .align 4 .b8 s_sad[2080];\n\
     .reg .pred %p<16>;\n\
     .reg .b32 %r<96>;\n\
     .reg .b64 %rd<24>;\n\
 \n\
     mov.u32 %r1, %tid.x;\n\
-    setp.gt.u32 %p1, %r1, 240;\n\
-    @%p1 bra M_PAD_SHARED;\n\
+    ld.param.u64 %rd1, [p_prev];\n\
+    ld.param.u64 %rd2, [p_curr];\n\
 \n\
-    // Decode candidate global rigid shift (%r2 = dx, %r3 = dy) for tid 0..=240\n\
+    // === STAGE 1: Coarse Global Search (dy in [-760..+760] @ 4px, dx in [-480..+480] @ 8px) ===\n\
+    setp.gt.u32 %p1, %r1, 500;\n\
+    @%p1 bra M_COARSE_PAD;\n\
+\n\
     mov.s32 %r2, 0;\n\
     mov.s32 %r3, 0;\n\
     setp.eq.u32 %p2, %r1, 0;\n\
-    @%p2 bra M_EVAL;\n\
+    @%p2 bra M_COARSE_EVAL;\n\
 \n\
-    setp.le.u32 %p3, %r1, 60;\n\
-    @%p3 bra M_DEC_VY_NEG;\n\
-    setp.le.u32 %p4, %r1, 120;\n\
-    @%p4 bra M_DEC_VY_POS;\n\
-    setp.le.u32 %p5, %r1, 180;\n\
-    @%p5 bra M_DEC_VX_NEG;\n\
+    setp.le.u32 %p3, %r1, 190;\n\
+    @%p3 bra M_C_VY_NEG;\n\
+    setp.le.u32 %p4, %r1, 380;\n\
+    @%p4 bra M_C_VY_POS;\n\
+    setp.le.u32 %p5, %r1, 440;\n\
+    @%p5 bra M_C_VX_NEG;\n\
 \n\
-    // 181..=240: dx = +(tid - 180) * 2\n\
-    sub.s32 %r2, %r1, 180;\n\
-    shl.b32 %r2, %r2, 1;\n\
-    bra M_EVAL;\n\
+    // 441..=500: dx = +(tid - 440) * 8\n\
+    sub.s32 %r2, %r1, 440;\n\
+    shl.b32 %r2, %r2, 3;\n\
+    bra M_COARSE_EVAL;\n\
 \n\
-M_DEC_VY_NEG:\n\
-    shl.b32 %r4, %r1, 1;\n\
+M_C_VY_NEG:\n\
+    shl.b32 %r4, %r1, 2;\n\
     neg.s32 %r3, %r4;\n\
-    bra M_EVAL;\n\
+    bra M_COARSE_EVAL;\n\
 \n\
-M_DEC_VY_POS:\n\
-    sub.s32 %r3, %r1, 60;\n\
-    shl.b32 %r3, %r3, 1;\n\
-    bra M_EVAL;\n\
+M_C_VY_POS:\n\
+    sub.s32 %r3, %r1, 190;\n\
+    shl.b32 %r3, %r3, 2;\n\
+    bra M_COARSE_EVAL;\n\
 \n\
-M_DEC_VX_NEG:\n\
-    sub.s32 %r4, %r1, 120;\n\
-    shl.b32 %r4, %r4, 1;\n\
+M_C_VX_NEG:\n\
+    sub.s32 %r4, %r1, 380;\n\
+    shl.b32 %r4, %r4, 3;\n\
     neg.s32 %r2, %r4;\n\
 \n\
-M_EVAL:\n\
-    ld.param.u64 %rd1, [p_prev];\n\
-    ld.param.u64 %rd2, [p_curr];\n\
-    mov.u32 %r40, 0;\n\
-    mov.s32 %r10, 320;\n\
+M_COARSE_EVAL:\n\
+    // Compute in-bounds overlap box for (dx=%r2, dy=%r3) inside scrollable content [280..2248] x [100..980]\n\
+    add.s32 %r10, 280, %r3;\n\
+    max.s32 %r10, %r10, 280;\n\
+    add.s32 %r17, 2248, %r3;\n\
+    min.s32 %r17, %r17, 2248;\n\
 \n\
-M_ROW_LOOP:\n\
-    setp.gt.s32 %p6, %r10, 2080;\n\
-    @%p6 bra M_WRITE_SHARED;\n\
+    add.s32 %r30, 100, %r2;\n\
+    max.s32 %r30, %r30, 100;\n\
+    add.s32 %r31, 980, %r2;\n\
+    min.s32 %r31, %r31, 980;\n\
+    sub.s32 %r31, %r31, %r30;\n\
+    max.s32 %r31, %r31, 64;\n\
+\n\
+    shr.s32 %r32, %r31, 3;\n\
+    add.s32 %r33, %r30, %r32;\n\
+    mad.lo.s32 %r34, %r32, 3, %r30;\n\
+    mad.lo.s32 %r35, %r32, 5, %r30;\n\
+    mad.lo.s32 %r36, %r32, 7, %r30;\n\
+\n\
+    mov.u32 %r40, 0;\n\
+    mov.u32 %r43, 0;\n\
+\n\
+M_C_ROW_LOOP:\n\
+    setp.gt.s32 %p6, %r10, %r17;\n\
+    @%p6 bra M_C_NORM;\n\
 \n\
     sub.s32 %r11, %r10, %r3;\n\
     mul.lo.u32 %r12, %r10, 1080;\n\
     mul.lo.u32 %r13, %r11, 1080;\n\
 \n\
-    // Probe Col 0: x_curr = 200\n\
-    add.u32 %r14, %r12, 200;\n\
+    // Col 0 (%r33)\n\
+    add.u32 %r14, %r12, %r33;\n\
     mul.wide.u32 %rd3, %r14, 4;\n\
     add.u64 %rd4, %rd2, %rd3;\n\
     ld.global.u32 %r20, [%rd4];\n\
@@ -155,7 +175,7 @@ M_ROW_LOOP:\n\
     add.u32 %r24, %r24, %r23;\n\
     shr.u32 %r24, %r24, 2;\n\
 \n\
-    sub.s32 %r15, 200, %r2;\n\
+    sub.s32 %r15, %r33, %r2;\n\
     add.u32 %r16, %r13, %r15;\n\
     mul.wide.u32 %rd5, %r16, 4;\n\
     add.u64 %rd6, %rd1, %rd5;\n\
@@ -168,8 +188,11 @@ M_ROW_LOOP:\n\
     shr.u32 %r29, %r29, 2;\n\
     sad.u32 %r40, %r24, %r29, %r40;\n\
 \n\
-    // Probe Col 1: x_curr = 420\n\
-    ld.global.u32 %r20, [%rd4+880];\n\
+    // Col 1 (%r34)\n\
+    add.u32 %r14, %r12, %r34;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
     and.b32 %r21, %r20, 255;\n\
     bfe.u32 %r22, %r20, 8, 8;\n\
     bfe.u32 %r23, %r20, 16, 8;\n\
@@ -177,7 +200,11 @@ M_ROW_LOOP:\n\
     add.u32 %r24, %r24, %r23;\n\
     shr.u32 %r24, %r24, 2;\n\
 \n\
-    ld.global.u32 %r25, [%rd6+880];\n\
+    sub.s32 %r15, %r34, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
     and.b32 %r26, %r25, 255;\n\
     bfe.u32 %r27, %r25, 8, 8;\n\
     bfe.u32 %r28, %r25, 16, 8;\n\
@@ -186,8 +213,11 @@ M_ROW_LOOP:\n\
     shr.u32 %r29, %r29, 2;\n\
     sad.u32 %r40, %r24, %r29, %r40;\n\
 \n\
-    // Probe Col 2: x_curr = 640\n\
-    ld.global.u32 %r20, [%rd4+1760];\n\
+    // Col 2 (%r35)\n\
+    add.u32 %r14, %r12, %r35;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
     and.b32 %r21, %r20, 255;\n\
     bfe.u32 %r22, %r20, 8, 8;\n\
     bfe.u32 %r23, %r20, 16, 8;\n\
@@ -195,7 +225,11 @@ M_ROW_LOOP:\n\
     add.u32 %r24, %r24, %r23;\n\
     shr.u32 %r24, %r24, 2;\n\
 \n\
-    ld.global.u32 %r25, [%rd6+1760];\n\
+    sub.s32 %r15, %r35, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
     and.b32 %r26, %r25, 255;\n\
     bfe.u32 %r27, %r25, 8, 8;\n\
     bfe.u32 %r28, %r25, 16, 8;\n\
@@ -204,8 +238,11 @@ M_ROW_LOOP:\n\
     shr.u32 %r29, %r29, 2;\n\
     sad.u32 %r40, %r24, %r29, %r40;\n\
 \n\
-    // Probe Col 3: x_curr = 860\n\
-    ld.global.u32 %r20, [%rd4+2640];\n\
+    // Col 3 (%r36)\n\
+    add.u32 %r14, %r12, %r36;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
     and.b32 %r21, %r20, 255;\n\
     bfe.u32 %r22, %r20, 8, 8;\n\
     bfe.u32 %r23, %r20, 16, 8;\n\
@@ -213,7 +250,11 @@ M_ROW_LOOP:\n\
     add.u32 %r24, %r24, %r23;\n\
     shr.u32 %r24, %r24, 2;\n\
 \n\
-    ld.global.u32 %r25, [%rd6+2640];\n\
+    sub.s32 %r15, %r36, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
     and.b32 %r26, %r25, 255;\n\
     bfe.u32 %r27, %r25, 8, 8;\n\
     bfe.u32 %r28, %r25, 16, 8;\n\
@@ -222,95 +263,345 @@ M_ROW_LOOP:\n\
     shr.u32 %r29, %r29, 2;\n\
     sad.u32 %r40, %r24, %r29, %r40;\n\
 \n\
+    add.u32 %r43, %r43, 4;\n\
     add.s32 %r10, %r10, 16;\n\
-    bra M_ROW_LOOP;\n\
+    bra M_C_ROW_LOOP;\n\
 \n\
-M_PAD_SHARED:\n\
+M_C_NORM:\n\
+    max.u32 %r43, %r43, 1;\n\
+    shl.b32 %r40, %r40, 8;\n\
+    div.u32 %r40, %r40, %r43;\n\
+    abs.s32 %r44, %r2;\n\
+    abs.s32 %r45, %r3;\n\
+    add.u32 %r44, %r44, %r45;\n\
+    add.u32 %r40, %r40, %r44;\n\
+    bra M_WRITE_COARSE;\n\
+\n\
+M_COARSE_PAD:\n\
     mov.u32 %r40, 0x3FFFFFFF;\n\
 \n\
-M_WRITE_SHARED:\n\
+M_WRITE_COARSE:\n\
     mov.u32 %r41, s_sad;\n\
     mad.lo.u32 %r42, %r1, 4, %r41;\n\
     st.shared.u32 [%r42], %r40;\n\
     bar.sync 0;\n\
 \n\
+    // Thread 0 selects best coarse candidate across 1..=500\n\
     setp.ne.u32 %p7, %r1, 0;\n\
-    @%p7 bra M_RET;\n\
+    @%p7 bra M_AFTER_COARSE_RED;\n\
 \n\
-    ld.param.u64 %rd10, [p_motion];\n\
     ld.shared.u32 %r50, [%r41];\n\
+    st.shared.u32 [%r41+2056], %r50;\n\
     setp.lt.u32 %p8, %r50, 48;\n\
-    @%p8 bra M_ZERO;\n\
+    @%p8 bra M_COARSE_INVALID;\n\
 \n\
     mov.u32 %r51, %r50;\n\
     mov.s32 %r52, 0;\n\
     mov.s32 %r53, 0;\n\
     mov.u32 %r60, 1;\n\
 \n\
-M_RED_LOOP:\n\
-    setp.gt.u32 %p9, %r60, 240;\n\
-    @%p9 bra M_CHECK_CONF;\n\
-\n\
+M_C_RED_LOOP:\n\
+    setp.gt.u32 %p9, %r60, 500;\n\
+    @%p9 bra M_C_RED_DONE;\n\
     mad.lo.u32 %r61, %r60, 4, %r41;\n\
     ld.shared.u32 %r62, [%r61];\n\
+    setp.ge.u32 %p11, %r62, %r51;\n\
+    @%p11 bra M_C_RED_NEXT;\n\
 \n\
     mov.s32 %r63, 0;\n\
     mov.s32 %r64, 0;\n\
-    setp.le.u32 %p10, %r60, 60;\n\
-    @%p10 bra M_R_VY_NEG;\n\
-    setp.le.u32 %p10, %r60, 120;\n\
-    @%p10 bra M_R_VY_POS;\n\
-    setp.le.u32 %p10, %r60, 180;\n\
-    @%p10 bra M_R_VX_NEG;\n\
-    sub.s32 %r63, %r60, 180;\n\
-    shl.b32 %r63, %r63, 1;\n\
-    bra M_R_CMP;\n\
-M_R_VY_NEG:\n\
-    shl.b32 %r65, %r60, 1;\n\
+    setp.le.u32 %p10, %r60, 190;\n\
+    @%p10 bra M_CR_VY_NEG;\n\
+    setp.le.u32 %p10, %r60, 380;\n\
+    @%p10 bra M_CR_VY_POS;\n\
+    setp.le.u32 %p10, %r60, 440;\n\
+    @%p10 bra M_CR_VX_NEG;\n\
+    sub.s32 %r63, %r60, 440;\n\
+    shl.b32 %r63, %r63, 3;\n\
+    bra M_CR_SAVE;\n\
+M_CR_VY_NEG:\n\
+    shl.b32 %r65, %r60, 2;\n\
     neg.s32 %r64, %r65;\n\
-    bra M_R_CMP;\n\
-M_R_VY_POS:\n\
-    sub.s32 %r64, %r60, 60;\n\
-    shl.b32 %r64, %r64, 1;\n\
-    bra M_R_CMP;\n\
-M_R_VX_NEG:\n\
-    sub.s32 %r65, %r60, 120;\n\
-    shl.b32 %r65, %r65, 1;\n\
+    bra M_CR_SAVE;\n\
+M_CR_VY_POS:\n\
+    sub.s32 %r64, %r60, 190;\n\
+    shl.b32 %r64, %r64, 2;\n\
+    bra M_CR_SAVE;\n\
+M_CR_VX_NEG:\n\
+    sub.s32 %r65, %r60, 380;\n\
+    shl.b32 %r65, %r65, 3;\n\
     neg.s32 %r63, %r65;\n\
-\n\
-M_R_CMP:\n\
-    abs.s32 %r66, %r63;\n\
-    abs.s32 %r67, %r64;\n\
-    add.u32 %r66, %r66, %r67;\n\
-    shr.u32 %r66, %r66, 2;\n\
-    add.u32 %r62, %r62, %r66;\n\
-    setp.ge.u32 %p11, %r62, %r51;\n\
-    @%p11 bra M_R_NEXT;\n\
+M_CR_SAVE:\n\
     mov.u32 %r51, %r62;\n\
     mov.s32 %r52, %r63;\n\
     mov.s32 %r53, %r64;\n\
 \n\
-M_R_NEXT:\n\
+M_C_RED_NEXT:\n\
     add.u32 %r60, %r60, 1;\n\
-    bra M_RED_LOOP;\n\
+    bra M_C_RED_LOOP;\n\
+\n\
+M_C_RED_DONE:\n\
+    or.b32 %r66, %r52, %r53;\n\
+    setp.eq.u32 %p8, %r66, 0;\n\
+    @%p8 bra M_COARSE_INVALID;\n\
+    st.shared.s32 [%r41+2048], %r52;\n\
+    st.shared.s32 [%r41+2052], %r53;\n\
+    st.shared.u32 [%r41+2060], 1;\n\
+    bra M_AFTER_COARSE_RED;\n\
+\n\
+M_COARSE_INVALID:\n\
+    st.shared.s32 [%r41+2048], 0;\n\
+    st.shared.s32 [%r41+2052], 0;\n\
+    st.shared.u32 [%r41+2060], 0;\n\
+\n\
+M_AFTER_COARSE_RED:\n\
+    bar.sync 0;\n\
+\n\
+    // === STAGE 2: 1-Pixel Exact Refinement Around Coarse Winner (tid 0..=14 -> delta -7..+7) ===\n\
+    ld.shared.u32 %r67, [%r41+2060];\n\
+    setp.eq.u32 %p1, %r67, 0;\n\
+    @%p1 bra M_FINE_PAD;\n\
+    setp.gt.u32 %p1, %r1, 14;\n\
+    @%p1 bra M_FINE_PAD;\n\
+\n\
+    ld.shared.s32 %r2, [%r41+2048];\n\
+    ld.shared.s32 %r3, [%r41+2052];\n\
+    sub.s32 %r4, %r1, 7;\n\
+    setp.ne.s32 %p2, %r3, 0;\n\
+    @%p2 bra M_FINE_VY;\n\
+    add.s32 %r2, %r2, %r4;\n\
+    bra M_FINE_EVAL;\n\
+M_FINE_VY:\n\
+    add.s32 %r3, %r3, %r4;\n\
+\n\
+M_FINE_EVAL:\n\
+    add.s32 %r10, 280, %r3;\n\
+    max.s32 %r10, %r10, 280;\n\
+    add.s32 %r17, 2248, %r3;\n\
+    min.s32 %r17, %r17, 2248;\n\
+\n\
+    add.s32 %r30, 100, %r2;\n\
+    max.s32 %r30, %r30, 100;\n\
+    add.s32 %r31, 980, %r2;\n\
+    min.s32 %r31, %r31, 980;\n\
+    sub.s32 %r31, %r31, %r30;\n\
+    max.s32 %r31, %r31, 64;\n\
+\n\
+    shr.s32 %r32, %r31, 3;\n\
+    add.s32 %r33, %r30, %r32;\n\
+    mad.lo.s32 %r34, %r32, 3, %r30;\n\
+    mad.lo.s32 %r35, %r32, 5, %r30;\n\
+    mad.lo.s32 %r36, %r32, 7, %r30;\n\
+\n\
+    mov.u32 %r40, 0;\n\
+    mov.u32 %r43, 0;\n\
+    mov.u32 %r75, 0;\n\
+    mov.u32 %r76, 99999;\n\
+\n\
+M_F_ROW_LOOP:\n\
+    setp.gt.s32 %p6, %r10, %r17;\n\
+    @%p6 bra M_F_NORM;\n\
+\n\
+    sub.s32 %r11, %r10, %r3;\n\
+    mul.lo.u32 %r12, %r10, 1080;\n\
+    mul.lo.u32 %r13, %r11, 1080;\n\
+\n\
+    add.u32 %r14, %r12, %r33;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
+    and.b32 %r21, %r20, 255;\n\
+    bfe.u32 %r22, %r20, 8, 8;\n\
+    bfe.u32 %r23, %r20, 16, 8;\n\
+    mad.lo.u32 %r24, %r22, 2, %r21;\n\
+    add.u32 %r24, %r24, %r23;\n\
+    shr.u32 %r24, %r24, 2;\n\
+    mov.u32 %r77, %r24;\n\
+\n\
+    sub.s32 %r15, %r33, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
+    and.b32 %r26, %r25, 255;\n\
+    bfe.u32 %r27, %r25, 8, 8;\n\
+    bfe.u32 %r28, %r25, 16, 8;\n\
+    mad.lo.u32 %r29, %r27, 2, %r26;\n\
+    add.u32 %r29, %r29, %r28;\n\
+    shr.u32 %r29, %r29, 2;\n\
+    sad.u32 %r40, %r24, %r29, %r40;\n\
+\n\
+    add.u32 %r14, %r12, %r34;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
+    and.b32 %r21, %r20, 255;\n\
+    bfe.u32 %r22, %r20, 8, 8;\n\
+    bfe.u32 %r23, %r20, 16, 8;\n\
+    mad.lo.u32 %r24, %r22, 2, %r21;\n\
+    add.u32 %r24, %r24, %r23;\n\
+    shr.u32 %r24, %r24, 2;\n\
+    add.u32 %r77, %r77, %r24;\n\
+    setp.eq.u32 %p13, %r76, 99999;\n\
+    @%p13 bra M_F_SKIP_GRAD;\n\
+    sad.u32 %r75, %r77, %r76, %r75;\n\
+M_F_SKIP_GRAD:\n\
+    mov.u32 %r76, %r77;\n\
+\n\
+    sub.s32 %r15, %r34, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
+    and.b32 %r26, %r25, 255;\n\
+    bfe.u32 %r27, %r25, 8, 8;\n\
+    bfe.u32 %r28, %r25, 16, 8;\n\
+    mad.lo.u32 %r29, %r27, 2, %r26;\n\
+    add.u32 %r29, %r29, %r28;\n\
+    shr.u32 %r29, %r29, 2;\n\
+    sad.u32 %r40, %r24, %r29, %r40;\n\
+\n\
+    add.u32 %r14, %r12, %r35;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
+    and.b32 %r21, %r20, 255;\n\
+    bfe.u32 %r22, %r20, 8, 8;\n\
+    bfe.u32 %r23, %r20, 16, 8;\n\
+    mad.lo.u32 %r24, %r22, 2, %r21;\n\
+    add.u32 %r24, %r24, %r23;\n\
+    shr.u32 %r24, %r24, 2;\n\
+\n\
+    sub.s32 %r15, %r35, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
+    and.b32 %r26, %r25, 255;\n\
+    bfe.u32 %r27, %r25, 8, 8;\n\
+    bfe.u32 %r28, %r25, 16, 8;\n\
+    mad.lo.u32 %r29, %r27, 2, %r26;\n\
+    add.u32 %r29, %r29, %r28;\n\
+    shr.u32 %r29, %r29, 2;\n\
+    sad.u32 %r40, %r24, %r29, %r40;\n\
+\n\
+    add.u32 %r14, %r12, %r36;\n\
+    mul.wide.u32 %rd3, %r14, 4;\n\
+    add.u64 %rd4, %rd2, %rd3;\n\
+    ld.global.u32 %r20, [%rd4];\n\
+    and.b32 %r21, %r20, 255;\n\
+    bfe.u32 %r22, %r20, 8, 8;\n\
+    bfe.u32 %r23, %r20, 16, 8;\n\
+    mad.lo.u32 %r24, %r22, 2, %r21;\n\
+    add.u32 %r24, %r24, %r23;\n\
+    shr.u32 %r24, %r24, 2;\n\
+\n\
+    sub.s32 %r15, %r36, %r2;\n\
+    add.u32 %r16, %r13, %r15;\n\
+    mul.wide.u32 %rd5, %r16, 4;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u32 %r25, [%rd6];\n\
+    and.b32 %r26, %r25, 255;\n\
+    bfe.u32 %r27, %r25, 8, 8;\n\
+    bfe.u32 %r28, %r25, 16, 8;\n\
+    mad.lo.u32 %r29, %r27, 2, %r26;\n\
+    add.u32 %r29, %r29, %r28;\n\
+    shr.u32 %r29, %r29, 2;\n\
+    sad.u32 %r40, %r24, %r29, %r40;\n\
+\n\
+    add.u32 %r43, %r43, 4;\n\
+    add.s32 %r10, %r10, 1;\n\
+    bra M_F_ROW_LOOP;\n\
+\n\
+M_F_NORM:\n\
+    max.u32 %r43, %r43, 1;\n\
+    shl.b32 %r40, %r40, 8;\n\
+    div.u32 %r40, %r40, %r43;\n\
+    shl.b32 %r75, %r75, 11;\n\
+    div.u32 %r75, %r75, %r43;\n\
+    abs.s32 %r44, %r2;\n\
+    abs.s32 %r45, %r3;\n\
+    add.u32 %r44, %r44, %r45;\n\
+    add.u32 %r40, %r40, %r44;\n\
+    bra M_WRITE_FINE;\n\
+\n\
+M_FINE_PAD:\n\
+    mov.u32 %r40, 0x3FFFFFFF;\n\
+    mov.u32 %r75, 0;\n\
+\n\
+M_WRITE_FINE:\n\
+    st.shared.u32 [%r42], %r40;\n\
+    setp.le.u32 %p13, %r1, 14;\n\
+    @%p13 st.shared.u32 [%r42+256], %r75;\n\
+    bar.sync 0;\n\
+\n\
+    setp.ne.u32 %p7, %r1, 0;\n\
+    @%p7 bra M_RET;\n\
+\n\
+    ld.param.u64 %rd10, [p_motion];\n\
+    ld.shared.u32 %r67, [%r41+2060];\n\
+    setp.eq.u32 %p8, %r67, 0;\n\
+    @%p8 bra M_ZERO;\n\
+\n\
+    ld.shared.s32 %r68, [%r41+2048];\n\
+    ld.shared.s32 %r69, [%r41+2052];\n\
+    ld.shared.u32 %r50, [%r41+2056];\n\
+\n\
+    mov.u32 %r51, 0x3FFFFFFF;\n\
+    mov.u32 %r78, 0;\n\
+    mov.s32 %r52, %r68;\n\
+    mov.s32 %r53, %r69;\n\
+    mov.u32 %r60, 0;\n\
+\n\
+M_F_RED_LOOP:\n\
+    setp.gt.u32 %p9, %r60, 14;\n\
+    @%p9 bra M_CHECK_CONF;\n\
+    mad.lo.u32 %r61, %r60, 4, %r41;\n\
+    ld.shared.u32 %r62, [%r61];\n\
+    setp.ge.u32 %p11, %r62, %r51;\n\
+    @%p11 bra M_F_RED_NEXT;\n\
+    mov.u32 %r51, %r62;\n\
+    ld.shared.u32 %r78, [%r61+256];\n\
+    sub.s32 %r64, %r60, 7;\n\
+    setp.ne.s32 %p10, %r69, 0;\n\
+    @%p10 bra M_FR_VY;\n\
+    add.s32 %r52, %r68, %r64;\n\
+    mov.s32 %r53, 0;\n\
+    bra M_F_RED_NEXT;\n\
+M_FR_VY:\n\
+    mov.s32 %r52, 0;\n\
+    add.s32 %r53, %r69, %r64;\n\
+M_F_RED_NEXT:\n\
+    add.u32 %r60, %r60, 1;\n\
+    bra M_F_RED_LOOP;\n\
 \n\
 M_CHECK_CONF:\n\
-    // Require global coherent SAD drop: best_cost * 16 < sad0 * 10\n\
+    or.b32 %r70, %r52, %r53;\n\
+    setp.eq.u32 %p12, %r70, 0;\n\
+    @%p12 bra M_ZERO;\n\
+    // Gate 1: Residual match error + regularization must be < 8.0 luma units (2048 in Q8)\n\
+    setp.ge.u32 %p12, %r51, 2048;\n\
+    @%p12 bra M_ZERO;\n\
+    // Gate 2: Overlap box must contain real spatial UI edges (prevents boundary-crop false minima!)\n\
+    setp.lt.u32 %p12, %r78, 64;\n\
+    @%p12 bra M_ZERO;\n\
+    // Gate 3: Require global coherent SAD drop: best_cost * 16 < sad0 * 9\n\
     mul.lo.u32 %r70, %r51, 16;\n\
-    mul.lo.u32 %r71, %r50, 10;\n\
+    mul.lo.u32 %r71, %r50, 9;\n\
     setp.ge.u32 %p12, %r70, %r71;\n\
     @%p12 bra M_ZERO;\n\
 \n\
-    and.b32 %r72, %r52, 255;\n\
-    and.b32 %r73, %r53, 255;\n\
-    shl.b32 %r73, %r73, 8;\n\
+    and.b32 %r72, %r52, 65535;\n\
+    and.b32 %r73, %r53, 65535;\n\
+    shl.b32 %r73, %r73, 16;\n\
     or.b32 %r74, %r72, %r73;\n\
-    or.b32 %r74, %r74, 0x00FF0000;\n\
     st.global.u32 [%rd10], %r74;\n\
+    st.global.u32 [%rd10+4], 1;\n\
     ret;\n\
 \n\
 M_ZERO:\n\
     st.global.u32 [%rd10], 0;\n\
+    st.global.u32 [%rd10+4], 0;\n\
 M_RET:\n\
     ret;\n\
 }\n\
@@ -325,7 +616,8 @@ M_RET:\n\
     .param .u32 p_dst_w,\n\
     .param .u32 p_dst_h,\n\
     .param .u32 p_alpha,\n\
-    .param .u32 p_flags\n\
+    .param .u32 p_flags,\n\
+    .param .u32 p_live_shift\n\
 )\n\
 {\n\
     .reg .pred %p<16>;\n\
@@ -352,6 +644,7 @@ M_RET:\n\
     ld.param.u32 %r12, [p_src_h];\n\
     ld.param.u32 %r13, [p_flags];\n\
     ld.param.u32 %r40, [p_alpha];\n\
+    ld.param.u32 %r49, [p_live_shift];\n\
 \n\
     // Base (sx=%r14, sy=%r15) in [0..src_w-3] x [0..src_h-3]\n\
     mul.lo.u32 %r14, %r6, %r11;\n\
@@ -372,7 +665,56 @@ M_RET:\n\
     mov.u32 %r60, 0;\n\
     mov.u32 %r61, 0;\n\
     mov.u32 %r62, 0;\n\
+    setp.ne.u32 %p11, %r1, %r1;\n\
 \n\
+    // Protect ONLY true hardware Status Bar + Notch (sy < 126) - zero y=268 or y=2300 horizontal seams!\n\
+    setp.lt.u32 %p5, %r15, 126;\n\
+    @%p5 bra SAMPLE_CURR_ONLY;\n\
+\n\
+    // Zero-latency 120Hz live finger/wheel GPU warp with C0-continuous 2:1 boundary taper (zero barcode & zero seam!)\n\
+    setp.eq.u32 %p5, %r49, 0;\n\
+    @%p5 bra CHECK_MOTION_WARP;\n\
+    bfe.s32 %r70, %r49, 0, 16;\n\
+    bfe.s32 %r71, %r49, 16, 16;\n\
+    max.s32 %r70, %r70, -36;\n\
+    min.s32 %r70, %r70, 36;\n\
+    sub.s32 %r14, %r14, %r70;\n\
+    max.s32 %r14, %r14, 0;\n\
+    min.s32 %r14, %r14, %r41;\n\
+    max.s32 %r71, %r71, -36;\n\
+    min.s32 %r71, %r71, 36;\n\
+    setp.eq.s32 %p5, %r71, 0;\n\
+    @%p5 bra LIVE_Y_DONE;\n\
+    setp.lt.s32 %p5, %r71, 0;\n\
+    @%p5 bra LIVE_Y_NEG;\n\
+    shl.b32 %r72, %r71, 1;\n\
+    add.s32 %r72, %r72, 126;\n\
+    setp.ge.s32 %p5, %r15, %r72;\n\
+    @%p5 bra LIVE_Y_SIMPLE;\n\
+    sub.s32 %r72, %r15, 126;\n\
+    shr.s32 %r72, %r72, 1;\n\
+    add.s32 %r15, %r72, 126;\n\
+    bra LIVE_Y_DONE;\n\
+LIVE_Y_NEG:\n\
+    shl.b32 %r72, %r71, 1;\n\
+    add.s32 %r72, %r42, %r72;\n\
+    setp.le.s32 %p5, %r15, %r72;\n\
+    @%p5 bra LIVE_Y_SIMPLE;\n\
+    sub.s32 %r72, %r42, %r15;\n\
+    shr.s32 %r72, %r72, 1;\n\
+    sub.s32 %r15, %r42, %r72;\n\
+    bra LIVE_Y_DONE;\n\
+LIVE_Y_SIMPLE:\n\
+    sub.s32 %r15, %r15, %r71;\n\
+LIVE_Y_DONE:\n\
+    max.s32 %r15, %r15, 126;\n\
+    min.s32 %r15, %r15, %r42;\n\
+    mov.u32 %r43, %r14;\n\
+    mov.u32 %r44, %r15;\n\
+    mov.u32 %r45, %r14;\n\
+    mov.u32 %r46, %r15;\n\
+\n\
+CHECK_MOTION_WARP:\n\
     setp.ge.u32 %p4, %r40, 256;\n\
     @%p4 bra SAMPLE_CURR_ONLY;\n\
 \n\
@@ -380,69 +722,73 @@ M_RET:\n\
     setp.eq.u64 %p5, %rd10, 0;\n\
     @%p5 bra SAMPLE_CURR_ONLY;\n\
 \n\
-    // Read single coherent global rigid motion vector d_motion[0]\n\
+    // Read single coherent 16-bit global rigid motion vector d_motion[0..1]\n\
     ld.global.u32 %r50, [%rd10];\n\
-    bfe.u32 %r51, %r50, 16, 8;\n\
+    ld.global.u32 %r51, [%rd10+4];\n\
     setp.eq.u32 %p6, %r51, 0;\n\
-    // No coherent scroll/swipe -> present crisp raw d_curr immediately (zero ghosting on cuts!)\n\
+    // No coherent scroll/swipe -> present crisp d_curr immediately (zero ghosting on cuts!)\n\
     @%p6 bra SAMPLE_CURR_ONLY;\n\
 \n\
-    // Protect Status Bar (sy < 128) & Home Indicator (sy >= 2300)\n\
-    setp.lt.u32 %p5, %r15, 128;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
-    setp.ge.u32 %p5, %r15, 2300;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
-\n\
-    bfe.s32 %r53, %r50, 0, 8;\n\
-    bfe.s32 %r54, %r50, 8, 8;\n\
-    // During vertical scroll (mv_y != 0), also keep iOS Navigation Bar (sy < 268) 100% static!\n\
-    setp.eq.s32 %p5, %r54, 0;\n\
-    @%p5 bra APPLY_MV_WARP;\n\
-    setp.lt.u32 %p5, %r15, 268;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
-\n\
-APPLY_MV_WARP:\n\
+    bfe.s32 %r53, %r50, 0, 16;\n\
+    bfe.s32 %r54, %r50, 16, 16;\n\
     sub.s32 %r55, 256, %r40;\n\
 \n\
-    // px = clamp(sx - ((alpha * mv_x + 128) >> 8), 0, src_w - 3)\n\
+    // raw_px = %r75, px = clamp(raw_px, 0, src_w - 3)\n\
     mad.lo.s32 %r56, %r40, %r53, 128;\n\
     shr.s32 %r56, %r56, 8;\n\
-    sub.s32 %r45, %r14, %r56;\n\
-    max.s32 %r45, %r45, 0;\n\
+    sub.s32 %r75, %r14, %r56;\n\
+    max.s32 %r45, %r75, 0;\n\
     min.s32 %r45, %r45, %r41;\n\
 \n\
-    // py = clamp(sy - ((alpha * mv_y + 128) >> 8), 0, src_h - 3)\n\
+    // raw_py = %r73, py = clamp(raw_py, 126, src_h - 3)\n\
     mad.lo.s32 %r56, %r40, %r54, 128;\n\
     shr.s32 %r56, %r56, 8;\n\
-    sub.s32 %r46, %r15, %r56;\n\
-    max.s32 %r46, %r46, 0;\n\
+    sub.s32 %r73, %r15, %r56;\n\
+    max.s32 %r46, %r73, 126;\n\
     min.s32 %r46, %r46, %r42;\n\
 \n\
-    // cx = clamp(sx + ((inv_a * mv_x + 128) >> 8), 0, src_w - 3)\n\
+    // raw_cx = %r76, cx = clamp(raw_cx, 0, src_w - 3)\n\
     mad.lo.s32 %r56, %r55, %r53, 128;\n\
     shr.s32 %r56, %r56, 8;\n\
-    add.s32 %r43, %r14, %r56;\n\
-    max.s32 %r43, %r43, 0;\n\
+    add.s32 %r76, %r14, %r56;\n\
+    max.s32 %r43, %r76, 0;\n\
     min.s32 %r43, %r43, %r41;\n\
 \n\
-    // cy = clamp(sy + ((inv_a * mv_y + 128) >> 8), 0, src_h - 3)\n\
+    // raw_cy = %r74, cy = clamp(raw_cy, 126, src_h - 3)\n\
     mad.lo.s32 %r56, %r55, %r54, 128;\n\
     shr.s32 %r56, %r56, 8;\n\
-    add.s32 %r44, %r15, %r56;\n\
-    max.s32 %r44, %r44, 0;\n\
+    add.s32 %r74, %r15, %r56;\n\
+    max.s32 %r44, %r74, 126;\n\
     min.s32 %r44, %r44, %r42;\n\
 \n\
-    // Prevent vertical scroll warps from sampling across static Nav Bar (<268) or Home Bar (>=2300)\n\
-    setp.eq.s32 %p5, %r54, 0;\n\
-    @%p5 bra COMPUTE_BOTH;\n\
-    setp.lt.u32 %p5, %r46, 268;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
-    setp.lt.u32 %p5, %r44, 268;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
-    setp.ge.u32 %p5, %r46, 2300;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
-    setp.ge.u32 %p5, %r44, 2300;\n\
-    @%p5 bra SAMPLE_CURR_ONLY;\n\
+    // Seamless entering/exiting viewport boundary synthesis (zero clamped barcode & zero mid-screen cut):\n\
+    setp.lt.s32 %p7, %r75, 0;\n\
+    setp.gt.s32 %p8, %r75, %r41;\n\
+    or.pred %p7, %p7, %p8;\n\
+    setp.lt.s32 %p8, %r73, 126;\n\
+    or.pred %p7, %p7, %p8;\n\
+    setp.gt.s32 %p8, %r73, %r42;\n\
+    or.pred %p7, %p7, %p8;\n\
+\n\
+    setp.lt.s32 %p9, %r76, 0;\n\
+    setp.gt.s32 %p10, %r76, %r41;\n\
+    or.pred %p9, %p9, %p10;\n\
+    setp.lt.s32 %p10, %r74, 126;\n\
+    or.pred %p9, %p9, %p10;\n\
+    setp.gt.s32 %p10, %r74, %r42;\n\
+    or.pred %p9, %p9, %p10;\n\
+\n\
+    and.pred %p8, %p7, %p9;\n\
+    @%p8 bra RESET_CURR_ONLY;\n\
+    @%p7 bra SAMPLE_CURR_ONLY;\n\
+    @!%p9 bra COMPUTE_BOTH;\n\
+    setp.eq.u32 %p11, %r1, %r1;\n\
+    bra COMPUTE_BOTH;\n\
+\n\
+RESET_CURR_ONLY:\n\
+    mov.u32 %r43, %r14;\n\
+    mov.u32 %r44, %r15;\n\
+    bra SAMPLE_CURR_ONLY;\n\
 \n\
 COMPUTE_BOTH:\n\
     // Sample 9-tap on d_prev at (%r45=px, %r46=py) -> (%r60=Bp, %r61=Gp, %r62=Rp)\n\
@@ -537,7 +883,11 @@ COMPUTE_BOTH:\n\
     shr.u32 %r62, %r32, 4;\n\
     mad.lo.u32 %r62, %r62, 3, %r35;\n\
     shr.u32 %r62, %r62, 2;\n\
-    bra SAMPLE_CURR;\n\
+    @!%p11 bra SAMPLE_CURR;\n\
+    mov.u32 %r18, %r60;\n\
+    mov.u32 %r19, %r61;\n\
+    mov.u32 %r20, %r62;\n\
+    bra APPLY_FX;\n\
 \n\
 SAMPLE_CURR_ONLY:\n\
     // Force %p4 = true so @%p4 bra APPLY_FX skips d_prev blend & occlusion fallback!\n\
@@ -822,11 +1172,14 @@ pub struct CudaAccelerator {
     pub frame_dirty: bool,
     pub temporal_alpha: u32,
     pub last_motion_valid: bool,
-    pub last_mv_x: i8,
-    pub last_mv_y: i8,
+    pub last_mv_x: i16,
+    pub last_mv_y: i16,
+    pub live_shift_x: i16,
+    pub live_shift_y: i16,
     has_prev_frame: bool,
     used_pinned_vp: bool,
     cached_alpha: u32,
+    cached_live_shift: u32,
     cached_vp: Vec<u32>,
     cached_w: u32,
     cached_h: u32,
@@ -913,9 +1266,12 @@ impl CudaAccelerator {
                     last_motion_valid: false,
                     last_mv_x: 0,
                     last_mv_y: 0,
+                    live_shift_x: 0,
+                    live_shift_y: 0,
                     has_prev_frame: false,
                     used_pinned_vp: false,
                     cached_alpha: 256,
+                    cached_live_shift: 0,
                     cached_vp: Vec::new(),
                     cached_w: 0,
                     cached_h: 0,
@@ -939,9 +1295,12 @@ impl CudaAccelerator {
             last_motion_valid: false,
             last_mv_x: 0,
             last_mv_y: 0,
+            live_shift_x: 0,
+            live_shift_y: 0,
             has_prev_frame: false,
             used_pinned_vp: false,
             cached_alpha: 256,
+            cached_live_shift: 0,
             cached_vp: Vec::new(),
             cached_w: 0,
             cached_h: 0,
@@ -961,13 +1320,30 @@ impl CudaAccelerator {
         self.temporal_alpha = alpha_256.min(256);
     }
 
+    #[inline]
+    pub fn set_live_shift(&mut self, dx: i16, dy: i16) {
+        self.live_shift_x = dx.clamp(-52, 52);
+        self.live_shift_y = dy.clamp(-52, 52);
+    }
+
+    #[inline]
+    fn packed_live_shift(&self, filter: &DisplayFilterConfig) -> u32 {
+        if filter.reduce_motion || filter.landscape {
+            return 0;
+        }
+        ((self.live_shift_x as u16) as u32) | (((self.live_shift_y as u16) as u32) << 16)
+    }
+
     pub fn reset_motion_history(&mut self) {
         self.has_prev_frame = false;
         self.last_motion_valid = false;
         self.last_mv_x = 0;
         self.last_mv_y = 0;
+        self.live_shift_x = 0;
+        self.live_shift_y = 0;
         self.temporal_alpha = 256;
         self.cached_alpha = 256;
+        self.cached_live_shift = 0;
         self.frame_dirty = true;
     }
 
@@ -1168,6 +1544,7 @@ impl CudaAccelerator {
                     h_pinned_src = p_src as *mut u8;
                     h_pinned_dst = p_dst as *mut u32;
                     *h_pinned_dst.add(dst_cap / 4) = 0;
+                    *h_pinned_dst.add(dst_cap / 4 + 1) = 0;
                     pinned_ok = !stream.is_null()
                         && cu_memcpy_htod_async.is_some()
                         && cu_memcpy_dtoh_async.is_some()
@@ -1233,9 +1610,11 @@ impl CudaAccelerator {
         } else {
             256
         };
+        let effective_live_shift = self.packed_live_shift(filter);
 
         let need_recompute = self.frame_dirty
             || self.cached_alpha != effective_alpha
+            || self.cached_live_shift != effective_live_shift
             || self.cached_w != dst_w
             || self.cached_h != dst_h
             || self.cached_filter.as_ref() != Some(filter)
@@ -1306,7 +1685,7 @@ impl CudaAccelerator {
                                     1,
                                     1,
                                     1,
-                                    256,
+                                    512,
                                     1,
                                     1,
                                     0,
@@ -1320,9 +1699,47 @@ impl CudaAccelerator {
                                         let _ = (c.cu_memcpy_dtoh_async.unwrap())(
                                             c.h_pinned_dst.add(c.dst_cap / 4) as *mut c_void,
                                             c.d_motion,
-                                            4,
+                                            8,
                                             c.stream,
                                         );
+                                        // Zero-overshoot ProMotion handoff when live finger warp is active:
+                                        // subtract exact Guest catch-up (mv_x, mv_y) BEFORE launching func_fb!
+                                        if self.live_shift_x != 0 || self.live_shift_y != 0 {
+                                            if (c.cu_stream_sync.unwrap())(c.stream) == 0 {
+                                                let mw0 = *c.h_pinned_dst.add(c.dst_cap / 4);
+                                                let mw1 = *c.h_pinned_dst.add(c.dst_cap / 4 + 1);
+                                                self.last_motion_valid = mw1 != 0;
+                                                self.last_mv_x = (mw0 & 0xFFFF) as u16 as i16;
+                                                self.last_mv_y =
+                                                    ((mw0 >> 16) & 0xFFFF) as u16 as i16;
+                                                let ly = self.live_shift_y as i32;
+                                                let my = self.last_mv_y as i32;
+                                                if self.last_motion_valid
+                                                    && my != 0
+                                                    && (ly * my) > 0
+                                                {
+                                                    if my.abs() < ly.abs() {
+                                                        self.live_shift_y =
+                                                            (ly - my).clamp(-760, 760) as i16;
+                                                        self.temporal_alpha = 256;
+                                                    } else {
+                                                        let start_a = (((ly.abs() as u32) * 256)
+                                                            / (my.abs() as u32).max(1)
+                                                            + 20)
+                                                            .min(256);
+                                                        self.live_shift_y = 0;
+                                                        self.temporal_alpha = start_a;
+                                                    }
+                                                    self.live_shift_x = 0;
+                                                } else if !self.last_motion_valid {
+                                                    self.live_shift_x =
+                                                        ((self.live_shift_x as i32) / 3) as i16;
+                                                    self.live_shift_y =
+                                                        ((self.live_shift_y as i32) / 3) as i16;
+                                                    self.temporal_alpha = 256;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1331,12 +1748,18 @@ impl CudaAccelerator {
                             }
                         }
 
-                        // 2. Launch 120Hz Motion-Compensated Retina Supersampler + GPU FX Kernel
+                        // 2. Launch 120Hz Motion-Compensated + Live-Warped Retina Supersampler + GPU FX Kernel
                         if upload_ok {
                             let run_alpha = if had_prev && !filter.reduce_motion {
                                 self.temporal_alpha.min(256)
                             } else {
                                 256
+                            };
+                            let run_live_shift = if filter.reduce_motion || filter.landscape {
+                                0
+                            } else {
+                                ((self.live_shift_x as u16) as u32)
+                                    | (((self.live_shift_y as u16) as u32) << 16)
                             };
                             let mut p_prev = c.d_prev;
                             let mut p_curr = c.d_curr;
@@ -1348,7 +1771,8 @@ impl CudaAccelerator {
                             let mut p_dh = dst_h;
                             let mut p_al = run_alpha;
                             let mut p_fl = filter.pack_gpu_flags();
-                            let mut params: [*mut c_void; 10] = [
+                            let mut p_ls = run_live_shift;
+                            let mut params: [*mut c_void; 11] = [
                                 &mut p_prev as *mut u64 as *mut c_void,
                                 &mut p_curr as *mut u64 as *mut c_void,
                                 &mut p_mot as *mut u64 as *mut c_void,
@@ -1359,6 +1783,7 @@ impl CudaAccelerator {
                                 &mut p_dh as *mut u32 as *mut c_void,
                                 &mut p_al as *mut u32 as *mut c_void,
                                 &mut p_fl as *mut u32 as *mut c_void,
+                                &mut p_ls as *mut u32 as *mut c_void,
                             ];
                             let gx = (dst_w + 15) / 16;
                             let gy = (dst_h + 15) / 16;
@@ -1387,15 +1812,17 @@ impl CudaAccelerator {
                                         && (c.cu_stream_sync.unwrap())(c.stream) == 0
                                     {
                                         if was_new_upload && had_prev {
-                                            let mw = *c.h_pinned_dst.add(c.dst_cap / 4);
-                                            self.last_motion_valid = ((mw >> 16) & 0xFF) != 0;
-                                            self.last_mv_x = (mw & 0xFF) as i8;
-                                            self.last_mv_y = ((mw >> 8) & 0xFF) as i8;
+                                            let mw0 = *c.h_pinned_dst.add(c.dst_cap / 4);
+                                            let mw1 = *c.h_pinned_dst.add(c.dst_cap / 4 + 1);
+                                            self.last_motion_valid = mw1 != 0;
+                                            self.last_mv_x = (mw0 & 0xFFFF) as u16 as i16;
+                                            self.last_mv_y = ((mw0 >> 16) & 0xFFFF) as u16 as i16;
                                         }
                                         cuda_ok = true;
                                         self.used_pinned_vp = true;
                                         self.kernel_launches += 1;
                                         self.cached_alpha = run_alpha;
+                                        self.cached_live_shift = run_live_shift;
                                     }
                                 } else {
                                     self.cached_vp.resize((dst_w * dst_h) as usize, 0);
@@ -1405,9 +1832,24 @@ impl CudaAccelerator {
                                         dst_bytes,
                                     ) == 0
                                     {
+                                        if was_new_upload && had_prev {
+                                            let mut m_host = [0u32; 2];
+                                            if (c.cu_memcpy_dtoh)(
+                                                m_host.as_mut_ptr() as *mut c_void,
+                                                c.d_motion,
+                                                8,
+                                            ) == 0
+                                            {
+                                                self.last_motion_valid = m_host[1] != 0;
+                                                self.last_mv_x = (m_host[0] & 0xFFFF) as u16 as i16;
+                                                self.last_mv_y =
+                                                    ((m_host[0] >> 16) & 0xFFFF) as u16 as i16;
+                                            }
+                                        }
                                         cuda_ok = true;
                                         self.kernel_launches += 1;
                                         self.cached_alpha = run_alpha;
+                                        self.cached_live_shift = run_live_shift;
                                     }
                                 }
                             }

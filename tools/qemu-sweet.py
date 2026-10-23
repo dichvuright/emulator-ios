@@ -2071,9 +2071,14 @@ def sync_hfsx_image(disk_path):
                                             changed = True
                                     elif name == 'com.apple.Accessibility.plist' and isinstance(pl, dict):
                                         want_rm = 1 if (hub_prefs and hub_prefs.get('reduce_motion') is True) else 0
-                                        if pl.get('ReduceMotionEnabled') != want_rm or pl.get('EnhancedBackgroundContrastEnabled') != 1:
+                                        if (
+                                            pl.get('ReduceMotionEnabled') != want_rm
+                                            or pl.get('EnhancedBackgroundContrastEnabled') != 1
+                                            or 'ReduceTransparencyEnabled' in pl
+                                        ):
                                             pl['ReduceMotionEnabled'] = want_rm
                                             pl['EnhancedBackgroundContrastEnabled'] = 1
+                                            pl.pop('ReduceTransparencyEnabled', None)
                                             changed = True
                                     elif name == '.GlobalPreferences.plist' and isinstance(pl, dict):
                                         if pl.get('UIAnimationDragCoefficient') != 0.05:

@@ -1012,4 +1012,103 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_wide_range_fast_swipe_and_live_warp() {
+        let mut cuda = CudaAccelerator::new();
+        let w = 1080usize;
+        let h = 2400usize;
+        let mut filter = DisplayFilterConfig::default();
+        filter.dark_mode = true;
+        let mut win_px = vec![0u32; 720 * 1600];
+
+        // Fast swipe: content row jumps by -363 px (well beyond old i8 [-120..+120] limit, and non-multiple of 4!)
+        // Frame 0: row at y = 1200..1228; Frame 1: row at y = 837..865 (mv_y = -363).
+        let mut fast0 = vec![0x1Cu8; w * h * 4];
+        let mut fast1 = vec![0x1Cu8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                fast0[i + 3] = 0xFF;
+                fast1[i + 3] = 0xFF;
+                if (1200..1228).contains(&y) && (120..960).contains(&x) {
+                    let v = if ((x / 16) & 1) == 0 { 0xF2 } else { 0x3A };
+                    fast0[i] = v;
+                    fast0[i + 1] = v;
+                    fast0[i + 2] = v;
+                }
+                if (837..865).contains(&y) && (120..960).contains(&x) {
+                    let v = if ((x / 16) & 1) == 0 { 0xF2 } else { 0x3A };
+                    fast1[i] = v;
+                    fast1[i + 1] = v;
+                    fast1[i + 2] = v;
+                }
+            }
+        }
+
+        // 1. Upload fast0 & verify zero-latency live_shift_y = -36 shifts y=1212 UP to sy=1176 (oy=784),
+        //    keeps Large Title across y=268 unbroken (bar y=250..290 shifts cleanly to sy=214..254 -> oy=160),
+        //    AND keeps bottom row across y=2300 unbroken without vertical barcode smearing!
+        for y in (250..290).chain(2288..2304) {
+            for x in 200..400 {
+                let i = (y * w + x) * 4;
+                fast0[i] = 0xE8;
+                fast0[i + 1] = 0xE8;
+                fast0[i + 2] = 0xE8;
+            }
+        }
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(256);
+        cuda.set_live_shift(0, -36);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &fast0, &filter);
+        if cuda.available {
+            let live_warped_luma = win_px[784 * 720 + 152] & 0xFF;
+            assert!(
+                live_warped_luma > 0xC0,
+                "Zero-latency live_shift_y=-36 must warp y=1212 up to oy=784 immediately (got 0x{:02x})",
+                live_warped_luma
+            );
+            // Large Title spanning y=250..290 must shift smoothly across y=268 to sy=240 (oy=160) with ZERO y=268 cut!
+            assert!(
+                (win_px[160 * 720 + 200] & 0xFF) > 0xC0,
+                "Large Title across y=268 must NOT be horizontally sliced during live_shift_y!"
+            );
+            // Below the shifted 2288..2304 bar (sy=2280 -> src 2316 -> oy=1520, and sy=2310 -> oy=1540 across y=2300),
+            // pixels must be 0x1C, with ZERO duplicated row at y=2300 and ZERO barcode smearing!
+            assert!(
+                ((win_px[1520 * 720 + 200] & 0xFF) as i32 - 0x1C).abs() <= 1
+                    && ((win_px[1540 * 720 + 200] & 0xFF) as i32 - 0x1C).abs() <= 1,
+                "Bottom viewport rows must NOT duplicate at y=2300 or smear into vertical barcode stripes!"
+            );
+            // Status bar + Notch (oy = 50 -> sy = 75 < 126) must remain unshifted 0x1C
+            assert!(
+                ((win_px[50 * 720 + 152] & 0xFF) as i32 - 0x1C).abs() <= 1,
+                "Status bar (sy < 126) must stay static during live_shift_y"
+            );
+        }
+
+        // 2. Upload fast1 with live_shift=0 and alpha=128 -> verify 1px-exact mv_y == -363 & midpoint sy = 1032 (oy = 688)
+        cuda.set_live_shift(0, 0);
+        cuda.mark_frame_dirty();
+        cuda.set_temporal_alpha(128);
+        cuda.blit_guest_fb_filtered(&mut win_px, 720, 1600, 0, 0, 720, 1600, &fast1, &filter);
+        println!(
+            "Wide-range CUDA swipe test: valid={}, mv=({}, {}), upload+flow={} us",
+            cuda.last_motion_valid, cuda.last_mv_x, cuda.last_mv_y, cuda.last_exec_us
+        );
+        if cuda.available {
+            assert!(cuda.last_motion_valid, "Fast -363px swipe must be detected as valid motion");
+            assert!(
+                (cuda.last_mv_y - (-363)).abs() <= 1,
+                "2-stage motion kernel must recover exact mv_y=-363 (got {})",
+                cuda.last_mv_y
+            );
+            let mid_fast_luma = win_px[688 * 720 + 152] & 0xFF;
+            assert!(
+                mid_fast_luma > 0xC0,
+                "Wide-range optical flow at alpha=128 must warp -363px swipe to midpoint oy=688 (got 0x{:02x})",
+                mid_fast_luma
+            );
+        }
+    }
 }

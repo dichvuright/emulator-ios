@@ -342,10 +342,14 @@ pub struct SweetEmuApp {
     pub hybrid_gpu_120hz: bool,
     pub interp_start_instant: Instant,
     pub interp_span_us: u64,
+    pub interp_start_alpha: u32,
     pub interp_active: bool,
+    pub smoothed_swap_dt_us: u64,
+    pub live_lead_y: f32,
     pub gpu_out_fps: f64,
     pub gpu_out_accum: u32,
     pub gpu_out_last_instant: Instant,
+    pub gpu_out_prev_tick: Instant,
     pub vm_boot_start: Instant,
     pub viewport_buf: Vec<u32>,
     pub qemu_fb_raw: Vec<u8>,
@@ -845,11 +849,15 @@ impl SweetEmuApp {
             hle_turbo_mode: false,
             hybrid_gpu_120hz: has_cuda,
             interp_start_instant: Instant::now(),
-            interp_span_us: 72_000,
+            interp_span_us: 115_000,
+            interp_start_alpha: 24,
             interp_active: false,
+            smoothed_swap_dt_us: 115_000,
+            live_lead_y: 0.0,
             gpu_out_fps: 0.0,
             gpu_out_accum: 0,
             gpu_out_last_instant: Instant::now(),
+            gpu_out_prev_tick: Instant::now(),
             vm_boot_start: Instant::now(),
             viewport_buf,
             qemu_fb_raw: initial_fb,
@@ -907,6 +915,8 @@ impl SweetEmuApp {
         }
         self.has_live_vm_frame = false;
         self.interp_active = false;
+        self.live_lead_y = 0.0;
+        self.wheel_preview_dy = 0.0;
         self.cuda.reset_motion_history();
         self.qemu_fb_raw.fill(0);
         self.vm_boot_start = Instant::now();
@@ -1027,6 +1037,21 @@ impl SweetEmuApp {
                 self.drag_started = true;
             }
             if self.drag_started
+                && !self.sim_state.edge_swipe_active
+                && !self.hle_turbo_mode
+                && self.has_live_vm_frame
+                && self.hybrid_gpu_120hz
+                && self.touch_start_x > 84
+                && self.touch_start_y > 130
+            {
+                let dy = iy - prev_iy;
+                if dy != 0 {
+                    self.live_lead_y = (self.live_lead_y + (dy as f32) * 0.65).clamp(-36.0, 36.0);
+                    self.cuda.set_live_shift(0, self.live_lead_y.round() as i16);
+                    self.ui_dirty = true;
+                }
+            }
+            if self.drag_started
                 && !self.hle_turbo_mode
                 && (ix - self.last_sent_x).abs() + (iy - self.last_sent_y).abs() >= 6
                 && self.last_sent_time.elapsed().as_millis() >= 8
@@ -1043,6 +1068,10 @@ impl SweetEmuApp {
         self.ui_dirty = true;
         self.sim_state.handle_scroll(wheel_delta);
         if !self.hle_turbo_mode {
+            if self.has_live_vm_frame && self.hybrid_gpu_120hz {
+                let step = (wheel_delta.signum() * 32) as f32;
+                self.wheel_preview_dy = (self.wheel_preview_dy + step).clamp(-36.0, 36.0);
+            }
             self.bridge.scroll_wheel(wheel_delta);
         }
     }
@@ -1138,13 +1167,13 @@ impl SweetEmuApp {
                     return;
                 }
                 let (tx, ty) = match app_name.as_str() {
-                    "Photos" => (190, 345),
-                    "App Store" => (380, 345),
-                    "Settings" => (565, 345),
+                    "Photos" => (195, 345),
+                    "App Store" => (425, 345),
+                    "Settings" => (655, 345),
                     "Phone" => (255, 2240),
                     "Safari" => (540, 2240),
                     "Messages" => (825, 2240),
-                    _ => (565, 345),
+                    _ => (655, 345),
                 };
                 self.bridge.tap(tx, ty);
                 self.log(format!(
@@ -1405,6 +1434,9 @@ impl SweetEmuApp {
                 // Toggle ipasim-style Host-Native 120Hz HLE Turbo Mode vs Live QEMU XNU VM
                 self.hle_turbo_mode = !self.hle_turbo_mode;
                 self.interp_active = false;
+                self.live_lead_y = 0.0;
+                self.wheel_preview_dy = 0.0;
+                self.cuda.set_live_shift(0, 0);
                 self.cuda.set_temporal_alpha(256);
                 self.ui_dirty = true;
                 self.chrome_dirty = true;
@@ -1419,6 +1451,9 @@ impl SweetEmuApp {
                 // Toggle Hybrid CPU+GPU 120Hz Pinned-DMA + Optical-Flow Motion Synthesizer
                 self.hybrid_gpu_120hz = !self.hybrid_gpu_120hz;
                 self.interp_active = false;
+                self.live_lead_y = 0.0;
+                self.wheel_preview_dy = 0.0;
+                self.cuda.set_live_shift(0, 0);
                 self.cuda.set_temporal_alpha(256);
                 self.ui_dirty = true;
                 self.chrome_dirty = true;
@@ -1429,6 +1464,9 @@ impl SweetEmuApp {
             }
             4 => {
                 // Power (Lock/Wake)
+                self.live_lead_y = 0.0;
+                self.wheel_preview_dy = 0.0;
+                self.cuda.set_live_shift(0, 0);
                 if self.hle_turbo_mode {
                     self.sim_state.locked = !self.sim_state.locked;
                     self.log(format!(
@@ -1442,6 +1480,9 @@ impl SweetEmuApp {
             }
             5 => {
                 // Home Swipe Gesture
+                self.live_lead_y = 0.0;
+                self.wheel_preview_dy = 0.0;
+                self.cuda.set_live_shift(0, 0);
                 if self.hle_turbo_mode {
                     if self.sim_state.locked {
                         self.sim_state.locked = false;
@@ -1741,55 +1782,99 @@ impl SweetEmuApp {
             }
         }
 
-        // 1b. Drive Hybrid NVIDIA CUDA 120Hz Optical-Flow Motion Synthesizer between guest swaps!
+        // 1b. Drive Hybrid NVIDIA CUDA 120Hz ProMotion Live-Warp + Wide-Range Optical-Flow Synthesizer!
+        let had_user_ui_dirty = self.ui_dirty;
         if got_new_frame {
+            if new_frame_swap_dt > 0.015 && new_frame_swap_dt < 0.45 {
+                let cur_us = (new_frame_swap_dt * 1_000_000.0) as u64;
+                self.smoothed_swap_dt_us =
+                    ((self.smoothed_swap_dt_us * 5 + cur_us * 3) / 8).clamp(28_000, 260_000);
+            }
             if self.hybrid_gpu_120hz
                 && self.cuda.available
                 && !self.hle_turbo_mode
                 && !self.filter.reduce_motion
                 && !self.filter.landscape
             {
-                let span_us = if new_frame_swap_dt > 0.012 && new_frame_swap_dt < 0.38 {
-                    ((new_frame_swap_dt * 930_000.0) as u64).clamp(36_000, 148_000)
-                } else {
-                    56_000
-                };
+                let span_us = ((self.smoothed_swap_dt_us * 102) / 100).clamp(32_000, 260_000);
                 self.interp_start_instant = Instant::now();
                 self.interp_span_us = span_us;
+                self.interp_start_alpha = 24;
                 self.interp_active = true;
-                self.cuda.set_temporal_alpha(40);
+                self.cuda.set_temporal_alpha(24);
             } else {
                 self.interp_active = false;
                 self.cuda.set_temporal_alpha(256);
             }
-        } else if self.interp_active {
-            if !self.hybrid_gpu_120hz
-                || !self.cuda.available
-                || !self.cuda.last_motion_valid
-                || self.hle_turbo_mode
-                || self.filter.reduce_motion
-                || self.filter.landscape
+        } else {
+            // Smooth 120Hz wheel flick glide into GPU live_shift_y before Guest swaps catch up
+            if self.wheel_preview_dy.abs() >= 1.0
+                && self.hybrid_gpu_120hz
+                && self.cuda.available
+                && !self.hle_turbo_mode
+                && !self.filter.reduce_motion
+                && !self.filter.landscape
             {
-                self.cuda.set_temporal_alpha(256);
-                self.interp_active = false;
+                let step = self.wheel_preview_dy * 0.28;
+                self.wheel_preview_dy -= step;
+                if self.wheel_preview_dy.abs() < 1.0 {
+                    self.wheel_preview_dy = 0.0;
+                }
+                self.live_lead_y = (self.live_lead_y + step).clamp(-36.0, 36.0);
+                self.cuda.set_live_shift(0, self.live_lead_y.round() as i16);
                 got_interp_step = true;
-            } else {
-                let el_us = self.interp_start_instant.elapsed().as_micros() as u64;
-                if el_us >= self.interp_span_us {
-                    // Settle 100% bit-exact onto raw guest Retina frame d_curr (alpha = 256)
+            } else if !self.sim_state.touch_down
+                && self.live_lead_y.abs() >= 0.5
+                && self.last_guest_swap_instant.elapsed().as_millis() > 260
+            {
+                // Scroll reached end-of-list rubber-band (no more Guest swaps) -> relax residual lead smoothly at 120Hz
+                self.live_lead_y *= 0.84;
+                if self.live_lead_y.abs() < 0.8 {
+                    self.live_lead_y = 0.0;
+                }
+                self.cuda.set_live_shift(0, self.live_lead_y.round() as i16);
+                got_interp_step = true;
+            }
+
+            if self.interp_active {
+                if !self.hybrid_gpu_120hz
+                    || !self.cuda.available
+                    || !self.cuda.last_motion_valid
+                    || self.hle_turbo_mode
+                    || self.filter.reduce_motion
+                    || self.filter.landscape
+                {
                     self.cuda.set_temporal_alpha(256);
                     self.interp_active = false;
+                    got_interp_step = true;
                 } else {
-                    let alpha = 40 + ((216 * el_us) / self.interp_span_us.max(1)) as u32;
-                    self.cuda.set_temporal_alpha(alpha.min(256));
+                    let el_us = self.interp_start_instant.elapsed().as_micros() as u64;
+                    if el_us >= self.interp_span_us {
+                        // Settle 100% bit-exact onto raw guest Retina frame d_curr (alpha = 256)
+                        self.cuda.set_temporal_alpha(256);
+                        self.interp_active = false;
+                    } else {
+                        let base_a = self.interp_start_alpha.min(256);
+                        let rem_a = 256u64.saturating_sub(base_a as u64);
+                        let alpha = base_a + ((rem_a * el_us) / self.interp_span_us.max(1)) as u32;
+                        self.cuda.set_temporal_alpha(alpha.min(256));
+                    }
+                    got_interp_step = true;
                 }
+            } else if self.sim_state.touch_down && self.drag_started && self.hybrid_gpu_120hz {
+                // Active 120Hz live finger hold/drag frame tick
                 got_interp_step = true;
             }
         }
 
         let req_path = self.workspace_dir.join("qemu_run").join("capture_ui.req");
         let capture_req = req_path.is_file();
-        let periodic_chrome = self.last_chrome_refresh.elapsed().as_millis() >= 600;
+        let active_motion = self.interp_active
+            || self.sim_state.touch_down
+            || self.wheel_preview_dy.abs() >= 1.0
+            || self.live_lead_y.abs() >= 1.0;
+        let chrome_interval_ms = if active_motion { 1200 } else { 600 };
+        let periodic_chrome = self.last_chrome_refresh.elapsed().as_millis() >= chrome_interval_ms;
         let booting_anim = !self.has_live_vm_frame
             && !self.hle_turbo_mode
             && self.last_chrome_refresh.elapsed().as_millis() >= 150;
@@ -1806,7 +1891,7 @@ impl SweetEmuApp {
         if !got_new_frame
             && !got_interp_step
             && !got_new_logs
-            && !self.ui_dirty
+            && !had_user_ui_dirty
             && !self.chrome_dirty
             && !periodic_chrome
             && !booting_anim
@@ -1850,9 +1935,20 @@ impl SweetEmuApp {
             self.draw_center_viewport_screen_only();
         }
 
-        if got_new_frame && self.interp_active && !self.cuda.last_motion_valid {
-            self.interp_active = false;
-            self.cuda.set_temporal_alpha(256);
+        if got_new_frame {
+            self.live_lead_y = self.cuda.live_shift_y as f32;
+            self.interp_start_alpha = self.cuda.temporal_alpha.min(256);
+            if !self.cuda.last_motion_valid || self.interp_start_alpha >= 256 {
+                self.interp_active = false;
+                self.cuda.set_temporal_alpha(256);
+            } else if self.hybrid_gpu_120hz
+                && self.cuda.available
+                && !self.hle_turbo_mode
+                && !self.filter.reduce_motion
+                && !self.filter.landscape
+            {
+                self.interp_active = true;
+            }
         }
 
         // 7. Update honest host & guest frame rate statistics (no artificial clamping)
@@ -1863,11 +1959,15 @@ impl SweetEmuApp {
             elapsed_us.max(1)
         };
         if got_new_frame || got_interp_step || hle_anim_active {
-            if self.gpu_out_accum == 0 {
-                self.gpu_out_last_instant = Instant::now();
+            let now_tick = Instant::now();
+            if self.gpu_out_accum == 0 || now_tick.duration_since(self.gpu_out_prev_tick).as_millis() > 90 {
+                self.gpu_out_accum = 1;
+                self.gpu_out_last_instant = now_tick;
+            } else {
+                self.gpu_out_accum += 1;
             }
-            self.gpu_out_accum += 1;
-            let gdt = self.gpu_out_last_instant.elapsed().as_secs_f64();
+            self.gpu_out_prev_tick = now_tick;
+            let gdt = now_tick.duration_since(self.gpu_out_last_instant).as_secs_f64();
             if gdt >= 0.16 && self.gpu_out_accum >= 2 {
                 let inst_out = (((self.gpu_out_accum - 1) as f64) / gdt).min(144.0);
                 self.gpu_out_fps = if self.gpu_out_fps < 1.0 {
@@ -1876,7 +1976,7 @@ impl SweetEmuApp {
                     self.gpu_out_fps * 0.45 + inst_out * 0.55
                 };
                 self.gpu_out_accum = 1;
-                self.gpu_out_last_instant = Instant::now();
+                self.gpu_out_last_instant = now_tick;
             }
         }
         self.fps_accum_frames += 1;
@@ -2940,6 +3040,22 @@ mod win32_gui {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetModuleHandleW(lp_module_name: *const u16) -> HINSTANCE;
+        fn CreateWaitableTimerExW(
+            lp_timer_attributes: *mut c_void,
+            lp_timer_name: *const u16,
+            dw_flags: u32,
+            dw_desired_access: u32,
+        ) -> *mut c_void;
+        fn SetWaitableTimer(
+            h_timer: *mut c_void,
+            lp_due_time: *const i64,
+            l_period: i32,
+            pfn_completion_routine: *const c_void,
+            lp_arg_to_completion_routine: *mut c_void,
+            f_resume: i32,
+        ) -> i32;
+        fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: u32) -> u32;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
     }
 
     #[link(name = "user32")]
@@ -3073,7 +3189,7 @@ mod win32_gui {
     }
 
     unsafe fn present_if_needed(hwnd: HWND, app: &mut SweetEmuApp, force_now: bool) {
-        if !force_now && app.last_present_instant.elapsed().as_micros() < 6800 {
+        if !force_now && app.last_present_instant.elapsed().as_micros() < 8_200 {
             return;
         }
         if app.render_full_window() {
@@ -3081,7 +3197,9 @@ mod win32_gui {
             let want_120 = app.interp_active
                 || app.hle_turbo_mode
                 || app.sim_state.touch_down
-                || app.last_guest_swap_instant.elapsed().as_millis() < 450;
+                || app.wheel_preview_dy.abs() >= 1.0
+                || app.live_lead_y.abs() >= 0.5
+                || app.last_guest_swap_instant.elapsed().as_millis() < 550;
             VBLANK_ACTIVE.store(want_120, std::sync::atomic::Ordering::Release);
             if app.last_render_was_full_chrome {
                 InvalidateRect(hwnd, null(), 0);
@@ -3128,13 +3246,17 @@ mod win32_gui {
                     let want_120 = (*app_ptr).interp_active
                         || (*app_ptr).hle_turbo_mode
                         || (*app_ptr).sim_state.touch_down
-                        || (*app_ptr).last_guest_swap_instant.elapsed().as_millis() < 450;
+                        || (*app_ptr).wheel_preview_dy.abs() >= 1.0
+                        || (*app_ptr).live_lead_y.abs() >= 0.5
+                        || (*app_ptr).last_guest_swap_instant.elapsed().as_millis() < 550;
                     VBLANK_ACTIVE.store(want_120, std::sync::atomic::Ordering::Release);
                 }
                 0
             }
             WM_TIMER => {
-                if !app_ptr.is_null() {
+                if !app_ptr.is_null()
+                    && !VBLANK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     present_if_needed(hwnd, &mut *app_ptr, true);
                 }
                 0
@@ -3169,6 +3291,7 @@ mod win32_gui {
             }
             WM_MOUSEWHEEL => {
                 if !app_ptr.is_null() {
+                    VBLANK_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
                     let delta = ((w_param >> 16) & 0xFFFF) as i16 as i32;
                     (*app_ptr).on_mouse_wheel(delta);
                     present_if_needed(hwnd, &mut *app_ptr, true);
@@ -3498,7 +3621,8 @@ mod win32_gui {
             SetForegroundWindow(hwnd);
             UpdateWindow(hwnd);
 
-            // Spawn dedicated 120Hz (8.33ms) VBlank Pacer bypassing Win32 USER_TIMER_MINIMUM (10..15.6ms)
+            // Spawn dedicated phase-locked 120.00Hz (8,333.3us) VBlank Pacer using Windows 11
+            // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (0x2) to eliminate Sleep(1ms) 84 FPS drift!
             VBLANK_EXIT.store(false, std::sync::atomic::Ordering::Release);
             VBLANK_QUEUED.store(false, std::sync::atomic::Ordering::Release);
             let hwnd_usize = hwnd as usize;
@@ -3506,24 +3630,53 @@ mod win32_gui {
             let _ = std::thread::Builder::new()
                 .name("sweet-120hz-vblank".into())
                 .spawn(move || {
+                    let h_timer = CreateWaitableTimerExW(
+                        null_mut(),
+                        null(),
+                        0x0000_0002, // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+                        0x001F_0003, // TIMER_ALL_ACCESS
+                    );
                     let mut next_tick = Instant::now();
+                    let mut tick_mod: u8 = 0;
                     while !VBLANK_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
                         let has_new_fb = bridge_state
                             .try_lock()
                             .map(|st| st.new_frame_ready)
                             .unwrap_or(false);
-                        if VBLANK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) || has_new_fb {
+                        let vblank_on = VBLANK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+                        if vblank_on || has_new_fb {
                             let now = Instant::now();
-                            if now < next_tick && !has_new_fb {
-                                let rem = next_tick - now;
-                                if rem.as_micros() > 1400 {
-                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                            if now < next_tick && (vblank_on || !has_new_fb) {
+                                let rem_us = (next_tick - now).as_micros() as u64;
+                                if rem_us > 950 && !h_timer.is_null() {
+                                    let due_100ns = -(((rem_us - 650) * 10) as i64);
+                                    if SetWaitableTimer(
+                                        h_timer,
+                                        &due_100ns,
+                                        0,
+                                        null(),
+                                        null_mut(),
+                                        0,
+                                    ) != 0
+                                    {
+                                        let _ = WaitForSingleObject(h_timer, 12);
+                                    }
                                 } else {
                                     std::hint::spin_loop();
                                 }
                                 continue;
                             }
-                            next_tick = Instant::now() + std::time::Duration::from_micros(8_333);
+                            let step_us = if tick_mod == 2 { 8_334u64 } else { 8_333u64 };
+                            tick_mod = (tick_mod + 1) % 3;
+                            let step_dur = std::time::Duration::from_micros(step_us);
+                            if !vblank_on && has_new_fb {
+                                next_tick = now + step_dur;
+                            } else {
+                                next_tick += step_dur;
+                                if now > next_tick + std::time::Duration::from_micros(16_667) {
+                                    next_tick = now + step_dur;
+                                }
+                            }
                             if !VBLANK_QUEUED.swap(true, std::sync::atomic::Ordering::AcqRel) {
                                 let _ = PostMessageW(
                                     hwnd_usize as HWND,
@@ -3533,9 +3686,27 @@ mod win32_gui {
                                 );
                             }
                         } else {
-                            std::thread::sleep(std::time::Duration::from_millis(4));
+                            if !h_timer.is_null() {
+                                let idle_100ns: i64 = -35_000; // 3.5 ms
+                                if SetWaitableTimer(
+                                    h_timer,
+                                    &idle_100ns,
+                                    0,
+                                    null(),
+                                    null_mut(),
+                                    0,
+                                ) != 0
+                                {
+                                    let _ = WaitForSingleObject(h_timer, 10);
+                                }
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(4));
+                            }
                             next_tick = Instant::now();
                         }
+                    }
+                    if !h_timer.is_null() {
+                        let _ = CloseHandle(h_timer);
                     }
                 });
 
