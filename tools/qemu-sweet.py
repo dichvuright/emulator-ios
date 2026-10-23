@@ -849,6 +849,95 @@ def capture_framebuffer(qmp_target, raw_path, png_path=None):
     return raw
 
 
+def patch_qemu_lockfree_timers(proc_handle):
+    """Clear ARM_CP_IO (0x400) on CNTVCT_EL0/CNTPCT_EL0 in suspended QEMU process memory.
+
+    Upstream QEMU 11.x marks CNTVCT_EL0/CNTPCT_EL0 with ARM_CP_IO (0x200) | ARM_CP_NO_RAW (0x400)
+    solely for -icount mode, forcing every mrs cntvct_el0 (mach_absolute_time / _ml_get_timebase)
+    in MTTCG to terminate the JIT TB (CF_LAST_IO) and acquire the global Big QEMU Lock (bql_lock).
+    Because gt_virt_cnt_read -> cpu_get_clock uses a lock-free seqlock + QPC in normal MTTCG mode,
+    clearing ARM_CP_IO (0x200 -> 0x600 becomes 0x400) in RAM before arm_cpu_realizefn() runs
+    eliminates global BQL contention across all 8 vCPUs without modifying the signed .exe.
+    """
+    if os.name != 'nt' or not proc_handle:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MBI(ctypes.Structure):
+            _fields_ = [
+                ('BaseAddress', ctypes.c_void_p),
+                ('AllocationBase', ctypes.c_void_p),
+                ('AllocationProtect', wintypes.DWORD),
+                ('PartitionId', wintypes.WORD),
+                ('RegionSize', ctypes.c_size_t),
+                ('State', wintypes.DWORD),
+                ('Protect', wintypes.DWORD),
+                ('Type', wintypes.DWORD),
+            ]
+
+        k32 = ctypes.windll.kernel32
+        mbi = MBI()
+        addr = 0
+        img_regions = []
+        while k32.VirtualQueryEx(proc_handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base = mbi.BaseAddress or 0
+            rsize = mbi.RegionSize or 0
+            # MEM_COMMIT (0x1000) & MEM_IMAGE (0x1000000) & PAGE_READONLY/READWRITE (0x02/0x04)
+            if mbi.State == 0x1000 and mbi.Type == 0x1000000 and (mbi.Protect & 0xff) in (0x02, 0x04) and rsize >= 0x100000:
+                img_regions.append((base, rsize))
+            addr = base + max(4096, rsize)
+            if addr >= (1 << 47):
+                break
+
+        reg_names = (
+            b'CNTVCT_EL0\x00', b'CNTVCTSS_EL0\x00', b'CNTPCT_EL0\x00', b'CNTPCTSS_EL0\x00',
+            b'CNTVCT\x00', b'CNTVCTSS\x00', b'CNTPCT\x00', b'CNTPCTSS\x00',
+        )
+        patched = 0
+        for base, rsize in img_regions:
+            buf = ctypes.create_string_buffer(rsize)
+            nread = ctypes.c_size_t(0)
+            if not k32.ReadProcessMemory(proc_handle, ctypes.c_void_p(base), buf, rsize, ctypes.byref(nread)):
+                continue
+            raw = buf.raw[:nread.value]
+            for reg_name in reg_names:
+                pos = 0
+                while True:
+                    s_idx = raw.find(reg_name, pos)
+                    if s_idx == -1:
+                        break
+                    pos = s_idx + 1
+                    if s_idx > 0 and raw[s_idx - 1] != 0:
+                        continue
+                    str_va = base + s_idx
+                    ptr_bytes = struct.pack('<Q', str_va)
+                    ppos = 0
+                    while True:
+                        ptr_idx = raw.find(ptr_bytes, ppos)
+                        if ptr_idx == -1:
+                            break
+                        ppos = ptr_idx + 8
+                        if ptr_idx + 0x18 > len(raw):
+                            continue
+                        cp_b, crn_b = raw[ptr_idx + 8], raw[ptr_idx + 9]
+                        cur_type = struct.unpack_from('<I', raw, ptr_idx + 0x14)[0]
+                        if ((cp_b == 0 and crn_b == 14) or (cp_b == 15 and crn_b == 0)) and (cur_type & 0x600) == 0x600:
+                            new_type = cur_type & ~0x200  # Clear ARM_CP_IO (0x200), preserve ARM_CP_NO_RAW (0x400)
+                            target_va = base + ptr_idx + 0x14
+                            old_p = wintypes.DWORD(0)
+                            if k32.VirtualProtectEx(proc_handle, ctypes.c_void_p(target_va), 4, 0x04, ctypes.byref(old_p)):
+                                nw = ctypes.c_size_t(0)
+                                k32.WriteProcessMemory(proc_handle, ctypes.c_void_p(target_va), struct.pack('<I', new_type), 4, ctypes.byref(nw))
+                                k32.VirtualProtectEx(proc_handle, ctypes.c_void_p(target_va), 4, old_p.value, ctypes.byref(old_p))
+                                if nw.value == 4:
+                                    patched += 1
+        return patched
+    except Exception:
+        return 0
+
+
 def build_accel_args(accel_mode, smp):
     """Determine QEMU -accel arguments based on --accel mode and --smp count."""
     mode = (accel_mode or 'auto').lower()
@@ -1074,7 +1163,38 @@ def main():
             pass
 
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        if os.name == 'nt':
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeBeginPeriod(1)
+            except Exception:
+                pass
+        if os.name == 'nt':
+            # CREATE_SUSPENDED (0x00000004): patch CNTVCT_EL0/CNTPCT_EL0 ARM_CP_IO in RAM before arm_cpu_realizefn()
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, creationflags=0x00000004)
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                hp = int(p._handle)
+                if hp:
+                    # ABOVE_NORMAL_PRIORITY_CLASS (0x00008000) -> schedule QEMU JIT threads on 5.3 GHz P-cores
+                    k32.SetPriorityClass(hp, 0x00008000)
+                    # Disable Windows 11 EcoQoS / E-core throttling (ProcessPowerThrottling = 4)
+                    throttling = struct.pack('<3I', 1, 1, 0)
+                    k32.SetProcessInformation(hp, 4, throttling, 12)
+                    n_patched = patch_qemu_lockfree_timers(hp)
+                    if n_patched:
+                        print(f'[+] Patched {n_patched} ARM generic timer regs in QEMU RAM (lock-free MTTCG CNTVCT_EL0)', file=sys.stderr)
+            except Exception:
+                pass
+            finally:
+                try:
+                    import ctypes
+                    ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+                except Exception:
+                    pass
+        else:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         if a.gdb:
             print('gdb stub on :1234; QMP:', mon, file=sys.stderr)
             p.wait()
@@ -1361,7 +1481,7 @@ def main():
                     do_fb_capture = gui_ready and (
                         last_written_fb is None
                         or do_png
-                        or (pending_swap_capture and (now - last_pmemsave_time >= (0.014 if fb_clients else 1.5)))
+                        or (pending_swap_capture and (now - last_pmemsave_time >= (0.014 if fb_clients else 10.0)))
                         or (not a.interactive and spotlight_seen_at == 0 and (now - last_pmemsave_time >= 0.35))
                     )
                     raw_live = b''
@@ -1864,6 +1984,9 @@ def sync_hfsx_image(disk_path):
                                                 'com.apple.syncdefaultsd.plist',
                                                 'com.apple.webbookmarksd.plist',
                                                 'com.apple.SafariBookmarksSyncAgent.plist',
+                                                'com.apple.Safari.History',
+                                                'com.apple.PasswordBreachAgent.plist',
+                                                'passwordbreachd',
                                                 'com.apple.ndoagent.plist',
                                                 'com.apple.mobilerepaird.plist',
                                                 'com.apple.announced.plist',
@@ -1880,7 +2003,7 @@ def sync_hfsx_image(disk_path):
                                                         dv['RunAtLoad'] = True
                                                         changed = True
                                                     continue
-                                                if any(tok in dk for tok in bg_throttle_tokens):
+                                                if any(tok in dk for tok in bg_throttle_tokens) or any(tok in dk for tok in no_ipc_bloat_tokens):
                                                     for k_strip in ('KeepAlive', 'LaunchEvents', 'Events', 'StartInterval', 'StartCalendarInterval'):
                                                         if k_strip in dv:
                                                             dv.pop(k_strip, None)
@@ -1895,6 +2018,38 @@ def sync_hfsx_image(disk_path):
                                                     for k_strip in ('MachServices', 'LaunchEvents', 'Events', 'KeepAlive', 'StartInterval', 'StartCalendarInterval'):
                                                         if k_strip in dv:
                                                             dv.pop(k_strip, None)
+                                                            changed = True
+                                        for ext_key in ('AppExtensions', 'XPCServices'):
+                                            exts = pl.get(ext_key)
+                                            if isinstance(exts, dict):
+                                                appex_bloat_tokens = (
+                                                    'VideoSubscriberAccount',
+                                                    'Safari.History',
+                                                    'SafariBookmarks',
+                                                    'SiriTTSService',
+                                                    'PasswordBreach',
+                                                    'passwordbreach',
+                                                    'Chrono',
+                                                    'Widget',
+                                                    'Activity',
+                                                    'Translate',
+                                                    'Diagnostic',
+                                                    'Shortcuts',
+                                                    'Reminders',
+                                                    'Podcasts',
+                                                    'Weather',
+                                                    'Stocks',
+                                                    'Health',
+                                                    'HomeKit',
+                                                )
+                                                for ek, ev in exts.items():
+                                                    if isinstance(ev, dict) and any(tok in ek for tok in appex_bloat_tokens):
+                                                        for k_strip in ('MachServices', 'LaunchEvents', 'Events', 'KeepAlive', 'StartInterval'):
+                                                            if k_strip in ev:
+                                                                ev.pop(k_strip, None)
+                                                                changed = True
+                                                        if ev.get('RunAtLoad'):
+                                                            ev['RunAtLoad'] = False
                                                             changed = True
                                     elif name == '.com.apple.mobile_container_manager.metadata.plist':
                                         if not isinstance(pl.get('MCMMetadataInfo'), dict):

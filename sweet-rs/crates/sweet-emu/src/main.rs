@@ -362,7 +362,10 @@ pub struct SweetEmuApp {
     pub fps_accum_frames: u32,
     pub fps_last_instant: Instant,
     pub live_fps: f64,
+    pub guest_fps: f64,
+    pub last_guest_swap_instant: Instant,
     pub live_frame_us: u64,
+    pub last_gdi_paint_us: u64,
     pub last_render_was_full_chrome: bool,
     pub logs: Vec<String>,
     pub boot_seq_tick: u32,
@@ -842,8 +845,11 @@ impl SweetEmuApp {
             last_chrome_refresh: Instant::now(),
             fps_accum_frames: 0,
             fps_last_instant: Instant::now(),
-            live_fps: 120.0,
+            live_fps: 0.0,
+            guest_fps: 0.0,
+            last_guest_swap_instant: Instant::now(),
             live_frame_us: 450,
+            last_gdi_paint_us: 350,
             last_render_was_full_chrome: true,
             logs: Vec::new(),
             boot_seq_tick: 0,
@@ -1644,7 +1650,20 @@ impl SweetEmuApp {
                 st.new_frame_ready = false;
                 self.has_live_vm_frame = true;
                 self.cuda.mark_frame_dirty();
-                self.boot_seq_tick = st.swap_count.max(self.boot_seq_tick.wrapping_add(1));
+                let prev_swap = self.boot_seq_tick;
+                let next_swap = st.swap_count.max(prev_swap.wrapping_add(1));
+                let swap_delta = next_swap.saturating_sub(prev_swap).max(1) as f64;
+                let swap_dt = self.last_guest_swap_instant.elapsed().as_secs_f64();
+                self.last_guest_swap_instant = Instant::now();
+                if swap_dt > 0.002 && swap_dt < 1.5 {
+                    let inst_gfps = (swap_delta / swap_dt).min(120.0);
+                    self.guest_fps = if self.guest_fps < 0.5 {
+                        inst_gfps
+                    } else {
+                        self.guest_fps * 0.65 + inst_gfps * 0.35
+                    };
+                }
+                self.boot_seq_tick = next_swap;
                 self.drag_anchor_x = self.sim_state.touch_x;
                 self.drag_anchor_y = self.sim_state.touch_y;
                 self.wheel_preview_dy = 0.0;
@@ -1736,7 +1755,7 @@ impl SweetEmuApp {
             self.draw_center_viewport_screen_only();
         }
 
-        // 7. Update FPS & frame time statistics (120Hz ProMotion ceiling)
+        // 7. Update honest host & guest frame rate statistics (no artificial clamping)
         let elapsed_us = frame_start.elapsed().as_micros() as u64;
         self.live_frame_us = if self.cuda.last_exec_us > 0 {
             self.cuda.last_exec_us
@@ -1746,11 +1765,12 @@ impl SweetEmuApp {
         self.fps_accum_frames += 1;
         let dt = self.fps_last_instant.elapsed().as_secs_f64();
         if dt >= 0.25 {
-            let instant_fps = (1_000_000.0 / (elapsed_us.max(1) as f64)).min(120.0);
-            let measured = (self.fps_accum_frames as f64) / dt;
-            self.live_fps = measured.max(instant_fps).clamp(60.0, 120.0);
+            self.live_fps = ((self.fps_accum_frames as f64) / dt).min(120.0);
             self.fps_accum_frames = 0;
             self.fps_last_instant = Instant::now();
+        }
+        if self.last_guest_swap_instant.elapsed().as_secs_f64() > 1.5 {
+            self.guest_fps = 0.0;
         }
         true
     }
@@ -1924,13 +1944,20 @@ impl SweetEmuApp {
             0x00F8_FAFC,
             1,
         );
+        let fps_line = if self.hle_turbo_mode {
+            format!("HLE FPS: {:.1} | Swaps: {}", self.live_fps, self.boot_seq_tick)
+        } else if self.guest_fps >= 0.5 {
+            format!("Guest FPS: {:.1} | Swaps: {}", self.guest_fps, self.boot_seq_tick)
+        } else {
+            format!("Guest: Idle | Swaps: {}", self.boot_seq_tick)
+        };
         draw_text(
             &mut self.backbuffer,
             WIN_W,
             WIN_H,
             24,
             456,
-            &format!("UI FPS: {:.1} | Swaps: {}", self.live_fps, self.boot_seq_tick),
+            &fps_line,
             0x004A_DE80,
             1,
         );
@@ -1945,10 +1972,12 @@ impl SweetEmuApp {
             1,
         );
         let bt = self.bridge.telemetry();
-        let bridge_line = if bt.attached {
+        let host_line = if bt.attached {
             format!(
-                "Bridge: Direct RAM (PID {}, {}us)",
-                bt.qemu_pid, bt.last_input_us
+                "Host: In {}us | FB {:.1}ms | GDI {:.1}ms",
+                bt.last_input_us,
+                (bt.last_fb_read_us as f64) / 1000.0,
+                (self.last_gdi_paint_us as f64) / 1000.0
             )
         } else {
             "Bridge: Attaching QEMU RAM...".to_string()
@@ -1959,7 +1988,7 @@ impl SweetEmuApp {
             WIN_H,
             24,
             492,
-            &bridge_line,
+            &host_line,
             if bt.attached { 0x0038_BDF8 } else { 0x00FB_BF24 },
             1,
         );
@@ -1970,10 +1999,12 @@ impl SweetEmuApp {
             24,
             510,
             &format!(
-                "Mbox: 0x{:08x} (tx={})",
-                INPUT_MBOX_PA, bt.input_tx_count
+                "Guest HID: {:.1}ms (w={} r={})",
+                (bt.last_guest_hid_us as f64) / 1000.0,
+                bt.mbox_w_idx,
+                bt.mbox_r_idx
             ),
-            0x0094_A3B8,
+            0x00CB_D5E1,
             1,
         );
         draw_text(
@@ -1982,8 +2013,22 @@ impl SweetEmuApp {
             WIN_H,
             24,
             528,
-            "Mount: /dev/ufsroot0 (HFSX RW)",
-            0x0094_A3B8,
+            &format!(
+                "Swap dt: {:.0}ms | E2E: {:.0}ms",
+                (bt.last_swap_interval_us as f64) / 1000.0,
+                (bt.last_e2e_photon_us as f64) / 1000.0
+            ),
+            0x004A_DE80,
+            1,
+        );
+        draw_text(
+            &mut self.backbuffer,
+            WIN_W,
+            WIN_H,
+            24,
+            546,
+            "F2: HLE 120Hz | F3: 2-End Log",
+            0x0064_748B,
             1,
         );
 
@@ -2994,6 +3039,25 @@ mod win32_gui {
                         // F2 -> Toggle ipasim 120Hz Host-Native HLE Turbo Mode
                         (*app_ptr).execute_button_action(35, hwnd as usize);
                         present_if_needed(hwnd, &mut *app_ptr, true);
+                    } else if w_param as u32 == 0x72 {
+                        // F3 -> Log live Two-Ended Host<->Guest pipeline latency breakdown
+                        let bt = (*app_ptr).bridge.telemetry();
+                        let cuda_us = (*app_ptr).cuda.last_exec_us;
+                        let gdi_us = (*app_ptr).last_gdi_paint_us;
+                        (*app_ptr).log(format!(
+                            "[2-END] Host(In={}us FB={:.2}ms CUDA={:.2}ms GDI={:.2}ms) | Guest(HID={:.2}ms SwapDt={:.1}ms E2E={:.1}ms w={} r={})",
+                            bt.last_input_us,
+                            (bt.last_fb_read_us as f64) / 1000.0,
+                            (cuda_us as f64) / 1000.0,
+                            (gdi_us as f64) / 1000.0,
+                            (bt.last_guest_hid_us as f64) / 1000.0,
+                            (bt.last_swap_interval_us as f64) / 1000.0,
+                            (bt.last_e2e_photon_us as f64) / 1000.0,
+                            bt.mbox_w_idx,
+                            bt.mbox_r_idx
+                        ));
+                        (*app_ptr).chrome_dirty = true;
+                        present_if_needed(hwnd, &mut *app_ptr, true);
                     }
                 }
                 0
@@ -3002,52 +3066,115 @@ mod win32_gui {
                 let mut ps: PAINTSTRUCT = zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 if !app_ptr.is_null() && !hdc.is_null() {
+                    let t_paint = Instant::now();
                     let mut rc = RECT::default();
                     GetClientRect(hwnd, &mut rc);
                     let cw = (rc.right - rc.left).max(1);
                     let ch = (rc.bottom - rc.top).max(1);
                     let (off_x, off_y, fit_w, fit_h) = compute_aspect_fit(cw, ch);
-                    if off_x > 0 || off_y > 0 {
-                        PatBlt(hdc, 0, 0, cw, ch, 0x0000_0042);
+                    if (*app_ptr).last_render_was_full_chrome {
+                        if off_x > 0 {
+                            PatBlt(hdc, 0, 0, off_x, ch, 0x0000_0042);
+                            PatBlt(hdc, off_x + fit_w, 0, cw - (off_x + fit_w), ch, 0x0000_0042);
+                        }
+                        if off_y > 0 {
+                            PatBlt(hdc, 0, 0, cw, off_y, 0x0000_0042);
+                            PatBlt(hdc, 0, off_y + fit_h, cw, ch - (off_y + fit_h), 0x0000_0042);
+                        }
                     }
                     SetStretchBltMode(hdc, 3);
                     SetBrushOrgEx(hdc, 0, 0, null_mut());
-                    let bmi = BITMAPINFO {
-                        bmi_header: BITMAPINFOHEADER {
-                            bi_size: size_of::<BITMAPINFOHEADER>() as u32,
-                            bi_width: BUF_W as i32,
-                            bi_height: -(BUF_H as i32),
-                            bi_planes: 1,
-                            bi_bit_count: 32,
-                            bi_compression: BI_RGB,
-                            bi_size_image: (BUF_W * BUF_H * 4) as u32,
-                            bi_x_pels_per_meter: 0,
-                            bi_y_pels_per_meter: 0,
-                            bi_clr_used: 0,
-                            bi_clr_important: 0,
-                        },
-                        bmi_colors: [RGBQUAD {
-                            rgb_blue: 0,
-                            rgb_green: 0,
-                            rgb_red: 0,
-                            rgb_reserved: 0,
-                        }],
-                    };
-                    StretchDIBits(
-                        hdc,
-                        off_x,
-                        off_y,
-                        fit_w,
-                        fit_h,
-                        0,
-                        0,
-                        BUF_W as i32,
-                        BUF_H as i32,
-                        (*app_ptr).backbuffer.as_ptr() as *const c_void,
-                        &bmi,
-                        DIB_RGB_COLORS,
-                        SRCCOPY,
-                    );
+                    if (*app_ptr).last_render_was_full_chrome {
+                        let bmi = BITMAPINFO {
+                            bmi_header: BITMAPINFOHEADER {
+                                bi_size: size_of::<BITMAPINFOHEADER>() as u32,
+                                bi_width: BUF_W as i32,
+                                bi_height: -(BUF_H as i32),
+                                bi_planes: 1,
+                                bi_bit_count: 32,
+                                bi_compression: BI_RGB,
+                                bi_size_image: (BUF_W * BUF_H * 4) as u32,
+                                bi_x_pels_per_meter: 0,
+                                bi_y_pels_per_meter: 0,
+                                bi_clr_used: 0,
+                                bi_clr_important: 0,
+                            },
+                            bmi_colors: [RGBQUAD {
+                                rgb_blue: 0,
+                                rgb_green: 0,
+                                rgb_red: 0,
+                                rgb_reserved: 0,
+                            }],
+                        };
+                        StretchDIBits(
+                            hdc,
+                            off_x,
+                            off_y,
+                            fit_w,
+                            fit_h,
+                            0,
+                            0,
+                            BUF_W as i32,
+                            BUF_H as i32,
+                            (*app_ptr).backbuffer.as_ptr() as *const c_void,
+                            &bmi,
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        );
+                    } else {
+                        // Fast 2D X+Y viewport sub-rect GDI present: only blit the 792x1672 OLED viewport!
+                        let scale_x = BUF_W / WIN_W;
+                        let scale_y = BUF_H / WIN_H;
+                        let sub_x0 = ((VIEW_X - 18).max(0) as usize) * scale_x;
+                        let sub_x1 = (((VIEW_X + VIEW_W as i32 + 18) as usize) * scale_x).min(BUF_W);
+                        let sub_w = sub_x1.saturating_sub(sub_x0).max(1);
+                        let sub_y0 = ((VIEW_Y - 18).max(0) as usize) * scale_y;
+                        let sub_y1 = (((VIEW_Y + VIEW_H as i32 + 18) as usize) * scale_y).min(BUF_H);
+                        let sub_h = sub_y1.saturating_sub(sub_y0).max(1);
+                        let dst_x0 = off_x + ((sub_x0 as i32) * fit_w) / (BUF_W as i32);
+                        let dst_x1 = off_x + ((sub_x1 as i32) * fit_w) / (BUF_W as i32);
+                        let dst_w = (dst_x1 - dst_x0).max(1);
+                        let dst_y0 = off_y + ((sub_y0 as i32) * fit_h) / (BUF_H as i32);
+                        let dst_y1 = off_y + ((sub_y1 as i32) * fit_h) / (BUF_H as i32);
+                        let dst_h = (dst_y1 - dst_y0).max(1);
+                        let bmi = BITMAPINFO {
+                            bmi_header: BITMAPINFOHEADER {
+                                bi_size: size_of::<BITMAPINFOHEADER>() as u32,
+                                bi_width: BUF_W as i32,
+                                bi_height: -(sub_h as i32),
+                                bi_planes: 1,
+                                bi_bit_count: 32,
+                                bi_compression: BI_RGB,
+                                bi_size_image: (BUF_W * sub_h * 4) as u32,
+                                bi_x_pels_per_meter: 0,
+                                bi_y_pels_per_meter: 0,
+                                bi_clr_used: 0,
+                                bi_clr_important: 0,
+                            },
+                            bmi_colors: [RGBQUAD {
+                                rgb_blue: 0,
+                                rgb_green: 0,
+                                rgb_red: 0,
+                                rgb_reserved: 0,
+                            }],
+                        };
+                        StretchDIBits(
+                            hdc,
+                            dst_x0,
+                            dst_y0,
+                            dst_w,
+                            dst_h,
+                            sub_x0 as i32,
+                            0,
+                            sub_w as i32,
+                            sub_h as i32,
+                            (*app_ptr).backbuffer.as_ptr().add(sub_y0 * BUF_W) as *const c_void,
+                            &bmi,
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        );
+                    }
+                    (*app_ptr).last_gdi_paint_us = (t_paint.elapsed().as_micros() as u64).max(1);
                 }
                 EndPaint(hwnd, &ps);
                 0

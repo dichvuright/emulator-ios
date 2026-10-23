@@ -26,13 +26,25 @@ use std::time::{Duration, Instant, SystemTime};
 use sweet_core::{
     direct_qemu_attachment_info, direct_qemu_enqueue_input, direct_qemu_invalidate_attachment,
     direct_qemu_read_bytes, direct_qemu_read_fb, direct_qemu_read_u64, QemuRunner, FB_H, FB_W,
+    INPUT_MBOX_PA,
 };
+
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(u_period: u32) -> u32;
+}
+
+fn monotonic_us() -> u64 {
+    static T_EPOCH: OnceLock<Instant> = OnceLock::new();
+    T_EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
 
 pub const SWAP_COUNT_PA: u64 = 0xa207_2020;
 pub const LOG_TOTAL_PA: u64 = 0xa1c5_2710;
 pub const LOG_RING_PA: u64 = 0xa1c5_2718;
 pub const TAP_DEADZONE_IOS_PX: i32 = 54;
-pub const MIN_TAP_HOLD_MS: u64 = 40;
+pub const MIN_TAP_HOLD_MS: u64 = 34;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BridgeTelemetry {
@@ -42,7 +54,12 @@ pub struct BridgeTelemetry {
     pub swap_count: u32,
     pub input_tx_count: u64,
     pub last_input_us: u64,
+    pub last_guest_hid_us: u64,
+    pub last_swap_interval_us: u64,
+    pub last_e2e_photon_us: u64,
     pub last_fb_read_us: u64,
+    pub mbox_w_idx: u32,
+    pub mbox_r_idx: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -105,7 +122,15 @@ pub struct AtomicBridgeMetrics {
     pub swap_count: AtomicU32,
     pub input_tx_count: AtomicU64,
     pub last_input_us: AtomicU64,
+    pub last_input_stamp_us: AtomicU64,
+    pub pending_hid_ack: AtomicBool,
+    pub pending_swap_ack: AtomicBool,
+    pub last_guest_hid_us: AtomicU64,
+    pub last_swap_interval_us: AtomicU64,
+    pub last_e2e_photon_us: AtomicU64,
     pub last_fb_read_us: AtomicU64,
+    pub mbox_w_idx: AtomicU32,
+    pub mbox_r_idx: AtomicU32,
 }
 
 impl Default for AtomicBridgeMetrics {
@@ -117,7 +142,15 @@ impl Default for AtomicBridgeMetrics {
             swap_count: AtomicU32::new(0),
             input_tx_count: AtomicU64::new(0),
             last_input_us: AtomicU64::new(3),
+            last_input_stamp_us: AtomicU64::new(0),
+            pending_hid_ack: AtomicBool::new(false),
+            pending_swap_ack: AtomicBool::new(false),
+            last_guest_hid_us: AtomicU64::new(0),
+            last_swap_interval_us: AtomicU64::new(0),
+            last_e2e_photon_us: AtomicU64::new(0),
             last_fb_read_us: AtomicU64::new(2100),
+            mbox_w_idx: AtomicU32::new(0),
+            mbox_r_idx: AtomicU32::new(0),
         }
     }
 }
@@ -148,8 +181,8 @@ fn send_udp_fallback(ev_type: u8, ev_id: u8, down: bool, x: i32, y: i32) {
 
 #[inline]
 fn normalize_nav_back_point(x: i32, y: i32) -> (i32, i32) {
-    if x < 72 && (115..=225).contains(&y) {
-        (72, y.clamp(145, 175))
+    if x < 105 && (105..=268).contains(&y) {
+        (88, y.clamp(148, 188))
     } else {
         (x, y)
     }
@@ -172,8 +205,12 @@ pub fn dispatch_raw_input(
     }
     let us = t0.elapsed().as_micros() as u64;
     if let Some(m) = metrics {
+        let now_us = monotonic_us();
         m.input_tx_count.fetch_add(1, Ordering::Relaxed);
         m.last_input_us.store(us.max(1), Ordering::Relaxed);
+        m.last_input_stamp_us.store(now_us, Ordering::Relaxed);
+        m.pending_hid_ack.store(true, Ordering::Relaxed);
+        m.pending_swap_ack.store(true, Ordering::Relaxed);
         if let Some((pid, base)) = direct_qemu_attachment_info() {
             m.attached.store(true, Ordering::Relaxed);
             m.qemu_pid.store(pid, Ordering::Relaxed);
@@ -191,6 +228,10 @@ pub struct SweetBridgeService {
 
 impl SweetBridgeService {
     pub fn new(workspace_dir: PathBuf) -> Self {
+        #[cfg(windows)]
+        unsafe {
+            let _ = timeBeginPeriod(1);
+        }
         let initial_fb = vec![0u8; FB_W * FB_H * 4];
         let state = Arc::new(Mutex::new(SharedBridgeState {
             raw_fb: initial_fb,
@@ -277,14 +318,14 @@ impl SweetBridgeService {
                                     let dist = ((dx * dx + dy * dy) as f32).sqrt();
                                     if dist >= 34.0 {
                                         let since_down = last_down_instant.elapsed().as_millis() as u64;
-                                        if since_down < 16 {
-                                            thread::sleep(Duration::from_millis(16 - since_down));
+                                        if since_down < 5 {
+                                            thread::sleep(Duration::from_millis(5 - since_down));
                                         }
                                         let scale = (36.0 / dist).min(0.5);
                                         let bx = (down_x + ((dx as f32) * scale).round() as i32).clamp(0, 1079);
                                         let by = (down_y + ((dy as f32) * scale).round() as i32).clamp(0, 2399);
                                         dispatch_raw_input(1, finger, true, bx, by, Some(&metrics_in));
-                                        thread::sleep(Duration::from_millis(16));
+                                        thread::sleep(Duration::from_millis(5));
                                         began_sent = true;
                                         last_step_dx = bx - last_dispatched_x;
                                         last_step_dy = by - last_dispatched_y;
@@ -303,14 +344,14 @@ impl SweetBridgeService {
                                     let step_dx = x - last_dispatched_x;
                                     let step_dy = y - last_dispatched_y;
                                     let step_manhattan = step_dx.abs() + step_dy.abs();
-                                    if step_manhattan >= 8
-                                        && ((cur_swap != last_move_swap && elapsed_ms >= 14) || elapsed_ms >= 22)
+                                    if step_manhattan >= 6
+                                        && ((cur_swap != last_move_swap && elapsed_ms >= 8) || elapsed_ms >= 11)
                                     {
                                         if step_manhattan >= 180 {
                                             let mx = (last_dispatched_x + x) / 2;
                                             let my = (last_dispatched_y + y) / 2;
                                             dispatch_raw_input(1, finger, true, mx, my, Some(&metrics_in));
-                                            thread::sleep(Duration::from_millis(14));
+                                            thread::sleep(Duration::from_millis(8));
                                         }
                                         dispatch_raw_input(1, finger, true, x, y, Some(&metrics_in));
                                         last_step_dx = step_dx;
@@ -355,14 +396,14 @@ impl SweetBridgeService {
                                         let dy = y - down_y;
                                         let dist = ((dx * dx + dy * dy) as f32).sqrt().max(1.0);
                                         let since_down = last_down_instant.elapsed().as_millis() as u64;
-                                        if since_down < 16 {
-                                            thread::sleep(Duration::from_millis(16 - since_down));
+                                        if since_down < 8 {
+                                            thread::sleep(Duration::from_millis(8 - since_down));
                                         }
                                         let scale = (36.0 / dist).min(0.4);
                                         let bx = (down_x + ((dx as f32) * scale).round() as i32).clamp(0, 1079);
                                         let by = (down_y + ((dy as f32) * scale).round() as i32).clamp(0, 2399);
                                         dispatch_raw_input(1, finger, true, bx, by, Some(&metrics_in));
-                                        thread::sleep(Duration::from_millis(16));
+                                        thread::sleep(Duration::from_millis(8));
                                         began_sent = true;
                                         last_dispatched_x = bx;
                                         last_dispatched_y = by;
@@ -375,13 +416,13 @@ impl SweetBridgeService {
                                     let mut end_y = y.clamp(0, 2399);
 
                                     if rem_manhattan >= 24 {
-                                        // 3 evenly-spaced Changed steps @ 16ms so _UIVelocityIntegrator registers
-                                        // full pan translation AND strong flick velocity for momentum scroll & Home swipe!
+                                        // 3 evenly-spaced Changed steps @ 6ms so _UIVelocityIntegrator registers
+                                        // full pan translation AND strong flick velocity without artificial lag!
                                         for step in 1..=3 {
                                             let sx = (last_dispatched_x + (rem_dx * step) / 3).clamp(0, 1079);
                                             let sy = (last_dispatched_y + (rem_dy * step) / 3).clamp(0, 2399);
                                             dispatch_raw_input(1, finger, true, sx, sy, Some(&metrics_in));
-                                            thread::sleep(Duration::from_millis(15));
+                                            thread::sleep(Duration::from_millis(6));
                                         }
                                     } else if last_move_instant.elapsed().as_millis() < 65
                                         && (last_step_dx.abs() + last_step_dy.abs()) >= 16
@@ -396,9 +437,9 @@ impl SweetBridgeService {
                                         end_y = (y + ((last_step_dy as f32 / step_len) * 28.0).round() as i32)
                                             .clamp(0, 2399);
                                         dispatch_raw_input(1, finger, true, end_x, end_y, Some(&metrics_in));
-                                        thread::sleep(Duration::from_millis(14));
+                                        thread::sleep(Duration::from_millis(5));
                                     } else {
-                                        thread::sleep(Duration::from_millis(12));
+                                        thread::sleep(Duration::from_millis(5));
                                     }
                                     dispatch_raw_input(1, finger, false, end_x, end_y, Some(&metrics_in));
                                 }
@@ -461,7 +502,7 @@ impl SweetBridgeService {
                                 let y3 = (yb + dir * span).clamp(320, 2120);
                                 for py in [y0, yb, y1, y2, y3] {
                                     dispatch_raw_input(1, 0, true, 540, py, Some(&metrics_in));
-                                    thread::sleep(Duration::from_millis(15));
+                                    thread::sleep(Duration::from_millis(9));
                                 }
                                 dispatch_raw_input(1, 0, false, 540, y3, Some(&metrics_in));
                             }
@@ -513,10 +554,41 @@ impl SweetBridgeService {
                     let mut tcp_stream: Option<TcpStream> = None;
                     let mut last_fb_hash: u64 = 0;
                     let mut last_swap_count: u64 = 0;
+                    let mut last_swap_instant: Instant = Instant::now();
                     let mut last_direct_log_total: u64 = 0;
+                    let mut mbox_hdr16 = [0u8; 16];
 
                     loop {
                         tick = tick.wrapping_add(1);
+
+                        // Two-ended HID mailbox telemetry: measure exact Guest _touch_thread drain (r_idx == w_idx)
+                        if metrics_fb.pending_hid_ack.load(Ordering::Relaxed) || tick % 8 == 0 {
+                            if direct_qemu_read_bytes(INPUT_MBOX_PA, &mut mbox_hdr16) {
+                                let w_idx = u32::from_le_bytes([
+                                    mbox_hdr16[4],
+                                    mbox_hdr16[5],
+                                    mbox_hdr16[6],
+                                    mbox_hdr16[7],
+                                ]);
+                                let r_idx = u32::from_le_bytes([
+                                    mbox_hdr16[8],
+                                    mbox_hdr16[9],
+                                    mbox_hdr16[10],
+                                    mbox_hdr16[11],
+                                ]);
+                                metrics_fb.mbox_w_idx.store(w_idx, Ordering::Relaxed);
+                                metrics_fb.mbox_r_idx.store(r_idx, Ordering::Relaxed);
+                                if w_idx == r_idx && metrics_fb.pending_hid_ack.swap(false, Ordering::Relaxed) {
+                                    let t_in = metrics_fb.last_input_stamp_us.load(Ordering::Relaxed);
+                                    let now_us = monotonic_us();
+                                    if now_us >= t_in && t_in > 0 {
+                                        metrics_fb
+                                            .last_guest_hid_us
+                                            .store((now_us - t_in).max(1), Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
 
                         // Fast path: 0.8 us Direct-RAM check of __ZL19sweet_fb_swap_count
                         if let Some(cur_swap) = direct_qemu_read_u64(SWAP_COUNT_PA) {
@@ -527,7 +599,26 @@ impl SweetBridgeService {
                             }
                             metrics_fb.swap_count.store(cur_swap as u32, Ordering::Relaxed);
 
-                            if cur_swap >= 1 && (cur_swap != last_swap_count || tick % 120 == 0) {
+                            let is_real_new_swap = cur_swap >= 1 && cur_swap != last_swap_count;
+                            if cur_swap >= 1 && (is_real_new_swap || tick % 120 == 0) {
+                                if is_real_new_swap {
+                                    let dt_swap_us = last_swap_instant.elapsed().as_micros() as u64;
+                                    last_swap_instant = Instant::now();
+                                    if last_swap_count > 0 && dt_swap_us < 3_000_000 {
+                                        metrics_fb
+                                            .last_swap_interval_us
+                                            .store(dt_swap_us.max(1), Ordering::Relaxed);
+                                    }
+                                    if metrics_fb.pending_swap_ack.swap(false, Ordering::Relaxed) {
+                                        let t_in = metrics_fb.last_input_stamp_us.load(Ordering::Relaxed);
+                                        let now_us = monotonic_us();
+                                        if now_us >= t_in && t_in > 0 && (now_us - t_in) < 5_000_000 {
+                                            metrics_fb
+                                                .last_e2e_photon_us
+                                                .store((now_us - t_in).max(1), Ordering::Relaxed);
+                                        }
+                                    }
+                                }
                                 last_swap_count = cur_swap;
                                 let t_fb = Instant::now();
                                 if direct_qemu_read_fb(&mut raw_fb) {
@@ -720,7 +811,12 @@ impl SweetBridgeService {
                             }
                         }
 
-                        thread::sleep(Duration::from_millis(2));
+                        let wait_ms = if metrics_fb.pending_hid_ack.load(Ordering::Relaxed) {
+                            1
+                        } else {
+                            2
+                        };
+                        thread::sleep(Duration::from_millis(wait_ms));
                     }
                 });
         }
@@ -738,6 +834,9 @@ impl SweetBridgeService {
         self.metrics.qemu_pid.store(0, Ordering::Relaxed);
         self.metrics.ram_base.store(0, Ordering::Relaxed);
         self.metrics.swap_count.store(0, Ordering::Relaxed);
+        self.metrics.last_guest_hid_us.store(0, Ordering::Relaxed);
+        self.metrics.last_swap_interval_us.store(0, Ordering::Relaxed);
+        self.metrics.last_e2e_photon_us.store(0, Ordering::Relaxed);
         if let Ok(mut st) = self.state.lock() {
             st.raw_fb.fill(0);
             st.new_frame_ready = false;
@@ -754,7 +853,12 @@ impl SweetBridgeService {
             swap_count: self.metrics.swap_count.load(Ordering::Relaxed),
             input_tx_count: self.metrics.input_tx_count.load(Ordering::Relaxed),
             last_input_us: self.metrics.last_input_us.load(Ordering::Relaxed),
+            last_guest_hid_us: self.metrics.last_guest_hid_us.load(Ordering::Relaxed),
+            last_swap_interval_us: self.metrics.last_swap_interval_us.load(Ordering::Relaxed),
+            last_e2e_photon_us: self.metrics.last_e2e_photon_us.load(Ordering::Relaxed),
             last_fb_read_us: self.metrics.last_fb_read_us.load(Ordering::Relaxed),
+            mbox_w_idx: self.metrics.mbox_w_idx.load(Ordering::Relaxed),
+            mbox_r_idx: self.metrics.mbox_r_idx.load(Ordering::Relaxed),
         }
     }
 

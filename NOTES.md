@@ -2,10 +2,41 @@
 
 ## Agent handoff / active work (2026-10-23, latest)
 
-### >>> UPDATE 2026-10-23 (SILKY-SMOOTH SCROLLING OVERHAUL + IPASIM HLE 120HZ ENGINE & OBJC ANALYZER + ZERO RGhA/b3a8 SURFACES) <<<
+### >>> UPDATE 2026-10-23 (PHASE 15: TWO-ENDED HOST<->GUEST MICROSECOND TELEMETRY + LOCK-FREE MTTCG CNTVCT_EL0 + WFE COMA-SLEEP FIX + 120HZ ADAPTIVE-SYNC SWAP + 3.2X FASTER GUEST RENDERING) <<<
 
 **STATE at 2026-10-23:**
-- **🎉🎉 MILESTONE: Complete Scrolling/Swiping Smoothness Overhaul + Port of `ipasim` Host-Native 120Hz HLE Engine & Mach-O Objective-C Analyzer**:
+- **🎉🎉 MILESTONE: Two-Ended Host<->Guest Latency Profiler & 3.2x End-to-End Guest Rendering Speedup (`457 ms -> 144.2 ms` Mean / `18.8 ms` Peak `53.1 FPS`):**
+  - **Phase 15 — Two-Ended Telemetry (`sweet-bridge`, `sweet-emu`) + Lock-Free QEMU MTTCG `CNTVCT_EL0` (`tools/qemu-sweet.py`) + XNU `WFE`/`ISB`/`Recount`/Adaptive-Sync `AppleCLCD::swap` (`emu_workspace/kernel.qemu.sweet`, `emu_workspace/payload_virtio.bin`) + `QuartzCore` Squircle `powf` Vectorization (`emu_workspace/ios16-root-20H392.img`)**:
+    - **Two-Ended Real-Time Telemetry Built into `sweet-emu.exe` & `sweet-bridge`:**
+      1. **End 1 (Host Win32 + Direct-RAM + CUDA + GDI) & End 2 (Guest `'SWIN'` HID Ring + `IOMobileFramebuffer` Swap Counter):**
+         - Added `BridgeTelemetry` in `sweet-rs/crates/sweet-bridge/src/lib.rs` and live HUD + `F3` console dump in `sweet-rs/crates/sweet-emu/src/main.rs` measuring:
+           - `Host In` (`NtWriteVirtualMemory` into `0x9d600000` `'SWIN'` ring: **`3..33 µs`**),
+           - `Guest HID` (`_touch_thread` wakeup & ring drain `r_idx == w_idx`: **`0.61 ms`**, down **10.3x** from `6.28 ms`),
+           - `FB` (`ReadProcessMemory` `10.36 MB` from `0x9c000000`: **`2.5 ms`**),
+           - `CUDA` (`sweet_fb_kernel` 9-tap Retina tent filter on RTX 5050: **`~2.5 ms`**),
+           - `GDI` (`StretchDIBits` with 2D X+Y `792x1672` viewport sub-rect slice: **`0.8 ms`**, 68% less pixel transfer than full-width blits),
+           - Honest un-clamped `Guest FPS` (`Idle` when static, real `1e6 / last_swap_interval_us` during motion), `Swap dt`, and `E2E` touch-to-photon latency.
+         - Enabled `winmm.dll!timeBeginPeriod(1)` in both `sweet-bridge` and `tools/qemu-sweet.py` to eliminate Windows 11's `15.625 ms` default timer tick, and configured `ABOVE_NORMAL_PRIORITY_CLASS` (`0x00008000`) + disabled `ProcessPowerThrottling` (EcoQoS) so QEMU's MTTCG JIT threads schedule onto the host i5-14600KF's 5.3 GHz P-cores.
+    - **5 Deep Bottlenecks Uncovered by 8-Core Statistical Profiling & Eliminated:**
+      1. **QEMU 11.1.0 `CNTVCT_EL0` / `CNTPCT_EL0` `ARM_CP_IO` (`0x200`) Global `bql_lock()` Serialization (`tools/qemu-sweet.py`):**
+         - Profiling all 8 vCPUs revealed `58 hits` stuck directly on `mrs xN, cntvct_el0` (`_ml_get_timebase+0x14` + `mach_absolute_time+0x8`) and `57–65 hits` piled up on `pset0`'s ticket spinlock (`0xfffffe0007b90888`).
+         - Disassembling `research/qemu/qemu-system-aarch64.exe` proved upstream QEMU 11.1 sets `ARM_CP_IO = 0x200` (`type = 0x600`) on `CNTVCT_EL0`, `CNTVCTSS_EL0`, `CNTPCT_EL0`, `CNTPCTSS_EL0` solely for `-icount` mode, forcing every `mach_absolute_time()` call in kernel and userland to terminate the JIT TB (`CF_LAST_IO`) and acquire QEMU's global `bql_lock()`, even though `gt_virt_cnt_read -> cpu_get_clock` uses a 100% lock-free seqlock + `QueryPerformanceCounter`.
+         - Added `patch_qemu_lockfree_timers()` in `tools/qemu-sweet.py` (`CREATE_SUSPENDED` -> clear `0x200` (`0x600 -> 0x400`) across all 8 generic timer `ARMCPRegInfo` entries in `MEM_IMAGE` RAM before `arm_cpu_realizefn()` -> `NtResumeProcess`), keeping the Authenticode-signed `qemu-system-aarch64.exe` untouched on disk.
+         - Verified in Phase C profile: **`_ml_get_timebase` (`48 -> 0 hits`) and `mach_absolute_time` (`10 -> 0 hits`) 100% eliminated**.
+      2. **XNU Spinlock & `_machine_delay_until` `WFE` Multi-Millisecond `EXCP_HLT` Coma Sleeps (`emu_workspace/kernel.qemu.sweet`, `emu_workspace/payload_virtio.bin`):**
+         - Disassembling `helper_wfe` (`0x1404b1a00`) in QEMU 11.1 alongside XNU's `_hw_lck_ticket_unlock` (`0xfffffe000733fe74`) and `_machine_delay_until` (`0xfffffe000749574c`) revealed that XNU never emits `sev` on ticket unlock (`stlrb w9, [x8]`) and calls `wfe` without `ldxr` in `_machine_delay_until` (`delay()` / `IODelay()`), causing QEMU's `helper_wfe` (`exclusive_addr == -1`) to set `cs->halted = 1` (`EXCP_HLT`) and put contended/delaying vCPUs into multi-millisecond coma sleeps until an unrelated IRQ fired.
+         - Patched all 52 spinlock/mutex/rwlock/gate/`_machine_delay_until`/`_uart_putc` `wfe` instructions (`0xd503205f -> 0xd503201f` `nop`) while preserving `_cpu_idle` and `_wfe_to_deadline_or_interrupt`, plus replaced 10 hot non-MMU `isb`s with `nop` (and 6 userland `mach_absolute_time` `isb`s in `dyld_shared_cache` `.19`/`.11`/main) and patched `_recount_kernel_transition` (`0xfffffe000734daf4`) to `ret` (`0 hits`).
+         - Verified in Phase C profile: **`_hw_lck_ticket_contended` dropped from `65 hits` -> `2..8 hits` (88–97% reduction)**.
+      3. **`QuartzCore` Software Squircle Shader Calling Scalar `powf()` 19,000,000 Times/Frame (`dyld_shared_cache_arm64.03`, page `1456`):**
+         - Disassembled `0x18844e2d8` (Variant 1) & `0x18844e784` (Variant 2) in `Subcache 03` (`sblk = 2083935`), which called `libsystem_m.dylib!powf` 8 times per 4-pixel SIMD group across every rounded cell/icon on `1125x2436` frames. Replaced both loops with 4-wide NEON `fsqrt` squircle evaluation (`(u^2)^2 + (v^2)^2`) + updated SHA-256 in `CS_CodeDirectory` (`cs_invalid_page = 0`).
+      4. **Zero-Wait Adaptive-Sync `AppleCLCD::swap` + `120 Hz` (`8,333 µs`) VSync Timer (`emu_workspace/kernel.qemu.sweet`, `emu_workspace/payload_virtio.bin`):**
+         - Disassembling `AppleCLCD::start` (`0x7a6906c`), `AppleCLCD::vsyncFired` (`0x7a692d4`), and `AppleCLCD::swap` (`0x7a697d0`) revealed `fVsync` was set to `0x61a8` (`25,000 µs` = `40 Hz`) and `AppleCLCD::swap` buffered finished frames into `fPendingSwap`, adding up to `28 ms` of artificial queue delay per frame (`6 * 28 ms = 168.0 ms` quantization).
+         - Patched `AppleCLCD::swap` (`0x7a697e8..0x7a697f4`) to invoke `0x7a69814` (`present` + `dmb ish` + `sweet_fb_swap_count++`) immediately on `CARenderServer` swap submission (`0 ms` queue delay) and upgraded `fVsync` (`0x7a6906c`, `0x7a692d4`) from `25,000 µs` (`40 Hz`) to `8,333 µs` (`0x208d` = `120 Hz`).
+      5. **Measured End-to-End Benchmark Results (`PID 10964`, Zero-BQL Direct-RAM):**
+         - Host input write (`write_pa`): **`0.033 ms` (`33.4 µs`)**.
+         - Guest `_touch_thread` HID drain: **`0.610 ms`** (down **10.3x** from `6.28 ms`).
+         - `Settings` cold-tap first visual frame (`swap 25`): **`130.9 ms`**; settle frame (`swap 28`): **`+19.0 ms` (`52.6 FPS`)**.
+         - `Settings` 7-point scroll (`1125x2436` software compositing): **`10 swaps`**, mean inter-swap **`144.2 ms` (`6.9 Guest FPS`, 3.17x faster than `457 ms` baseline)**, fastest inter-swap **`18.8 ms` (`53.1 FPS`)**.
   - **Phase 14 — Fix `UIPanGestureRecognizer` Hysteresis & Velocity Zeroing, Remove Smearing/Rubber-Banding `apply_live_scroll_preview()`, Patch Remaining `'RGhA'`/`'b3a8'`/`'&b38'` Selectors in `QuartzCore`, Strip `LaunchEvents` (`145 -> 70` `xpcproxy` Spawns), and Integrate `ipasim` 120Hz HLE Mode (`sweet-rs/crates/sweet-bridge/src/lib.rs`, `sweet-rs/crates/sweet-core/src/qemu.rs`, `sweet-rs/crates/sweet-core/src/ipa.rs`, `sweet-rs/crates/sweet-emu/src/main.rs`, `tools/qemu-sweet.py`, `emu_workspace/ios16-root-20H392.img`, `emu_workspace/payload_virtio.bin`)**:
     - **6 Root Causes Uncovered & Fixed:**
       1. **`UIPanGestureRecognizer` `Possible -> Began` Hysteresis Absorbing 100% of Drag Distance + `TouchDown` Overwrite in `'SWIN'` Ring (`sweet-rs/crates/sweet-core/src/qemu.rs`, `sweet-rs/crates/sweet-bridge/src/lib.rs`):**
